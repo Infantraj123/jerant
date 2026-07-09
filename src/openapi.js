@@ -223,7 +223,7 @@ function buildOperation({ route, runtime, components, opts, sourceIndex }) {
 
   if (validation.meta.summary) op.summary = validation.meta.summary;
   if (validation.meta.deprecated) op.deprecated = true;
-  op.operationId = (method + componentName(route.method, oaPath, '')).replace(/^(\w)/, (c) => c.toLowerCase());
+  op.operationId = componentName(route.method, oaPath, '').replace(/^(\w)/, (c) => c.toLowerCase());
 
   // --- Parameters (path + query) ---
   const parameters = [];
@@ -440,7 +440,10 @@ function buildOperation({ route, runtime, components, opts, sourceIndex }) {
   if (validation.meta.tags && validation.meta.tags.length) {
     op.tags = [...validation.meta.tags];
   } else {
-    const firstSegment = route.path.split('/').filter((s) => s && !s.startsWith(':'))[0];
+    // Group by the first meaningful segment: '/api/v1/users/...' -> 'users'.
+    const segments = route.path.split('/').filter((s) => s && !s.startsWith(':'));
+    const generic = (s) => s === 'api' || /^v\d+$/i.test(s);
+    const firstSegment = segments.find((s) => !generic(s)) || segments[0];
     op.tags = [firstSegment || 'default'];
   }
 
