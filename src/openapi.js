@@ -8,6 +8,8 @@
 const fs = require('fs');
 const path = require('path');
 const { detectSchema, expressValidator } = require('./adapters');
+const { analyzeHandles } = require('./static-analysis');
+const { loadSourceIndex, scanRouteSource } = require('./source-scan');
 const { nodeToJsonSchema, stabilityScore } = require('./inference');
 const {
   sourceConfidence,
@@ -18,6 +20,28 @@ const {
 const { jsonClone, pascalCase, isPlainObject } = require('./util');
 
 const BODYLESS_METHODS = new Set(['GET', 'HEAD']);
+
+// Middleware function names that mark a route as consuming multipart/form-data.
+const MULTIPART_MIDDLEWARE_NAMES = new Set(['multerMiddleware', 'fileupload', 'busboy']);
+
+function detectMultipartMiddleware(handles) {
+  return (handles || []).some(
+    (h) => typeof h === 'function' && MULTIPART_MIDDLEWARE_NAMES.has(h.name)
+  );
+}
+
+function dominantContentType(runtime) {
+  const counts = (runtime && runtime.contentTypes) || {};
+  let best = null;
+  let bestCount = 0;
+  for (const [type, count] of Object.entries(counts)) {
+    if (count > bestCount) {
+      best = type;
+      bestCount = count;
+    }
+  }
+  return best;
+}
 
 function toOpenApiPath(expressPath) {
   let out = expressPath
@@ -60,7 +84,7 @@ function detectValidation(handles) {
           if (detected) result.responses[status] = detected;
         }
       }
-      for (const field of ['summary', 'description', 'tags', 'deprecated']) {
+      for (const field of ['summary', 'description', 'tags', 'deprecated', 'contentType', 'files']) {
         if (marker[field] !== undefined && result.meta[field] === undefined) {
           result.meta[field] = marker[field];
         }
@@ -162,10 +186,38 @@ function defaultProjectInfo() {
   }
 }
 
-function buildOperation({ route, runtime, components, opts }) {
+/** Fold project-source findings into the per-function analysis result. */
+function mergeScanFindings(statics, scan) {
+  if (!scan) return statics;
+  const union = (a, b) => [...new Set([...a, ...b])];
+  const merged = {
+    bodyFields: union(statics.bodyFields, scan.bodyFields),
+    queryFields: union(statics.queryFields, scan.queryFields),
+    paramsFields: union(statics.paramsFields, scan.paramsFields),
+    fileFields: union(statics.fileFields, scan.fileFields),
+    usesFiles: statics.usesFiles || scan.usesFiles || scan.multipart,
+    genericFile: statics.genericFile,
+    statusCodes: union(statics.statusCodes, scan.statusCodes),
+  };
+  // Upload config in source names the real fields — drop the req.file guess.
+  if (scan.fileFields.length && statics.genericFile) {
+    merged.fileFields = merged.fileFields.filter((f) => f !== 'file' || scan.fileFields.includes('file'));
+    merged.genericFile = false;
+  }
+  return merged;
+}
+
+function buildOperation({ route, runtime, components, opts, sourceIndex }) {
   const oaPath = toOpenApiPath(route.path);
   const method = route.method.toLowerCase();
   const validation = detectValidation(route.handles);
+  // Deepest fallback: mine the handler source for fields the code actually
+  // reads (req.body.x, req.query.x, req.files.doc, res.status codes), both
+  // from the live function objects and from the project's source files.
+  const statics = mergeScanFindings(
+    analyzeHandles(route.handles),
+    scanRouteSource(sourceIndex, route.method, route.path)
+  );
   const op = {};
   const sources = {};
 
@@ -196,6 +248,19 @@ function buildOperation({ route, runtime, components, opts }) {
   } else if (runtime && runtime.query.count) {
     querySchema = nodeToJsonSchema(runtime.query);
     sources.query = 'runtime';
+    // Code may read query fields no traffic has exercised yet.
+    for (const field of statics.queryFields) {
+      if (!querySchema.properties[field]) {
+        querySchema.properties[field] = {};
+        sources.query = 'runtime + code-analysis';
+      }
+    }
+  } else if (statics.queryFields.length) {
+    querySchema = {
+      type: 'object',
+      properties: Object.fromEntries(statics.queryFields.map((f) => [f, {}])),
+    };
+    sources.query = 'code-analysis';
   }
   if (querySchema && querySchema.type === 'object' && querySchema.properties) {
     const requiredList = querySchema.required || [];
@@ -220,13 +285,61 @@ function buildOperation({ route, runtime, components, opts }) {
   } else if (runtime && runtime.body.count && !BODYLESS_METHODS.has(route.method)) {
     bodySchema = nodeToJsonSchema(runtime.body);
     sources.body = 'runtime';
+    if (bodySchema.type === 'object' && bodySchema.properties) {
+      for (const field of statics.bodyFields) {
+        if (!bodySchema.properties[field]) {
+          bodySchema.properties[field] = {};
+          sources.body = 'runtime + code-analysis';
+        }
+      }
+    }
+  } else if (statics.bodyFields.length && !BODYLESS_METHODS.has(route.method)) {
+    bodySchema = {
+      type: 'object',
+      properties: Object.fromEntries(statics.bodyFields.map((f) => [f, {}])),
+    };
+    sources.body = 'code-analysis';
   }
+  // Distinguish form-data uploads from raw JSON payloads. Priority:
+  // explicit declaration > upload middleware on the route (multer et al)
+  // > media type observed in live traffic > JSON.
+  const requestContentType =
+    validation.meta.contentType ||
+    (detectMultipartMiddleware(route.handles) || statics.usesFiles ? 'multipart/form-data' : null) ||
+    (runtime && dominantContentType(runtime)) ||
+    'application/json';
+  const isMultipart = requestContentType === 'multipart/form-data' ||
+    requestContentType === 'application/x-www-form-urlencoded';
+
+  if (isMultipart || requestContentType !== 'application/json') {
+    // File fields: declared via validate({files: [...]}) or seen at runtime.
+    const knownFileFields = [
+      ...(Array.isArray(validation.meta.files) ? validation.meta.files : []),
+      ...Object.keys((runtime && runtime.fileFields) || {}),
+    ];
+    // The generic req.file placeholder gives way once a real name is known.
+    const staticFileFields = statics.fileFields.filter(
+      (f) => !(f === 'file' && statics.genericFile && knownFileFields.length)
+    );
+    const fileFieldNames = new Set([...knownFileFields, ...staticFileFields]);
+    if (requestContentType === 'multipart/form-data' && (fileFieldNames.size || bodySchema || !BODYLESS_METHODS.has(route.method))) {
+      const base = bodySchema && bodySchema.type === 'object'
+        ? jsonClone(bodySchema)
+        : { type: 'object', properties: {} };
+      if (!base.properties) base.properties = {};
+      for (const name of fileFieldNames) {
+        base.properties[name] = { type: 'string', format: 'binary' };
+      }
+      bodySchema = base;
+    }
+  }
+
   if (bodySchema) {
     const hoisted = maybeHoist(components, componentName(route.method, oaPath, 'Request'), bodySchema);
-    const examples = runtime ? runtime.examples.request : [];
+    const examples = !isMultipart && runtime ? runtime.examples.request : [];
     op.requestBody = {
       required: bodyRequired,
-      content: { 'application/json': mediaType(hoisted, examples) },
+      content: { [requestContentType]: mediaType(hoisted, examples) },
     };
   }
 
@@ -266,13 +379,25 @@ function buildOperation({ route, runtime, components, opts }) {
       if (!sources[`response:${status}`]) sources[`response:${status}`] = 'runtime';
     }
   }
-  if (Object.keys(responses).length === 0) {
+  // Status codes the handler source mentions but nothing else documented.
+  const documentedElsewhere = Object.keys(responses).length > 0;
+  for (const status of statics.statusCodes) {
+    if (!responses[status]) {
+      responses[status] = { description: `${statusDescription(status)} (detected in handler code)` };
+      sources[`response:${status}`] = 'code-analysis';
+    }
+  }
+  // A handler that only sets error statuses explicitly (res.status(404))
+  // still has an implicit 200 success path (res.json / res.send).
+  if (!documentedElsewhere && !Object.keys(responses).some((s) => Number(s) < 400)) {
     responses['200'] = { description: 'Successful response' };
   }
   op.responses = responses;
 
   // --- Source + confidence ---
-  const validationSources = Object.values(sources).filter((s) => s !== 'runtime');
+  const NON_VALIDATION = new Set(['runtime', 'code-analysis', 'runtime + code-analysis']);
+  const validationSources = Object.values(sources).filter((s) => !NON_VALIDATION.has(s));
+  const usedCodeAnalysis = Object.values(sources).some((s) => s.includes('code-analysis'));
   const observations = runtime ? runtime.observations : 0;
   let primarySource;
   let confidence;
@@ -281,12 +406,15 @@ function buildOperation({ route, runtime, components, opts }) {
     primarySource = distinct.join(' + ');
     confidence = Math.min(...distinct.map(sourceConfidence));
   } else if (observations > 0) {
-    primarySource = 'runtime';
+    primarySource = usedCodeAnalysis ? 'runtime + code-analysis' : 'runtime';
     const stability = Math.min(
       ...['body', 'query', 'params'].map((loc) => (runtime[loc].count ? stabilityScore(runtime[loc]) : 1)),
       ...Object.values(runtime.responses).map((n) => stabilityScore(n))
     );
     confidence = runtimeConfidence(observations, stability);
+  } else if (usedCodeAnalysis || statics.fileFields.length) {
+    primarySource = 'code-analysis';
+    confidence = sourceConfidence('code-analysis');
   } else {
     primarySource = 'route-scan';
     confidence = ROUTE_SCAN_CONFIDENCE;
@@ -333,11 +461,15 @@ function buildSpec({ routes, registry, opts }) {
   const components = { schemas: {} };
   const paths = {};
   let documented = 0;
+  let sourceIndex = null;
+  try {
+    sourceIndex = loadSourceIndex(opts.sourceScan);
+  } catch { /* source scanning must never break spec generation */ }
 
   for (const route of routes) {
     if (route.internal) continue;
     const runtime = registry.get(route.key);
-    const { oaPath, method, op } = buildOperation({ route, runtime, components, opts });
+    const { oaPath, method, op } = buildOperation({ route, runtime, components, opts, sourceIndex });
     if (!paths[oaPath]) paths[oaPath] = {};
     paths[oaPath][method] = op;
     documented += 1;

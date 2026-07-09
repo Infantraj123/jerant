@@ -11,6 +11,7 @@ const SOURCE_CONFIDENCE = {
   manual: 100,
   'express-validator': 90,
   'class-validator': 90,
+  'code-analysis': 55,
 };
 
 const ROUTE_SCAN_CONFIDENCE = 25;
@@ -36,6 +37,8 @@ const SOURCE_LABELS = {
   'class-validator': 'class-validator',
   manual: 'Manual',
   runtime: 'Runtime Analysis',
+  'code-analysis': 'Code Analysis',
+  'runtime + code-analysis': 'Runtime Analysis + Code Analysis',
   'route-scan': 'Route Scanner',
 };
 

@@ -32,7 +32,8 @@ jerant picks the **highest-quality schema source available** for every route, au
 
 1. **Validation schemas** — Zod, Joi, Yup, AJV, express-validator, class-validator schemas found on your routes are converted to OpenAPI schemas (100% confidence).
 2. **Runtime traffic analysis** — for routes with no validation, jerant observes real requests and responses, infers schemas (types, nested objects, optional and nullable fields), and keeps improving them as more traffic flows.
-3. **Route scanning** — every route (including nested routers) appears in the docs from the moment the server starts, even before any traffic.
+3. **Static code analysis** — for routes with no validation and no traffic yet, jerant reads your code itself: fields the handlers access (`req.body.x`, `{a, b} = req.body`, `req.query.x`), file uploads (`req.file`/`req.files.doc` → documented as `multipart/form-data` with binary fields), and response status codes (`res.status(422)`). This includes a **full project source scan** (the entry script's directory, configurable via `sourceScan`), so it also sees what live function objects hide: handlers wrapped in `asyncHandler(...)` closures, controllers referenced by name from other files, and the real upload field names configured on the route (`upload.single('avatar')`, `upload.array('photos')`, `upload.fields([{ name: 'id_front' }])`). When a handler hands the whole payload to a service (`orderService.create(req.body)`), jerant **follows the payload down to the database query** — fields read from the service's parameter, columns in SQL `INSERT INTO ... (...)` / `UPDATE ... SET`, and query-builder writes like `.insert({ status: data.status })` all become documented request fields.
+4. **Route scanning** — every route (including nested routers) appears in the docs from the moment the server starts, even before any traffic.
 
 Every operation in the UI shows its **source and confidence score**:
 
@@ -100,6 +101,23 @@ Legacy apps still get useful docs. jerant's runtime analyzer watches `req.body`,
 Observation 1: { "name": "John" }
 Observation 2: { "name": "Alice", "age": 25 }
 Result:        name: string (required), age: integer (optional)
+```
+
+### Form-data vs raw JSON
+
+jerant documents the correct request media type per route:
+
+- Routes with upload middleware (**multer**, express-fileupload) are automatically documented as `multipart/form-data` — no traffic or config needed. The source scan recovers the actual field names from your multer config (`upload.single('avatar')`, `upload.fields([{ name: 'id_front' }])`).
+- File fields seen at runtime (`req.file`/`req.files`) appear as binary file inputs alongside the text fields from your validation schema.
+- Everything else defaults to raw `application/json`, or whatever media type live traffic actually uses.
+- Explicit control when you want it:
+
+```js
+app.post("/avatars",
+  upload.single("avatar"),
+  doc({ contentType: "multipart/form-data", files: ["avatar"] }),
+  handler
+);
 ```
 
 ### Documentation without validation

@@ -56,12 +56,28 @@ function createAnalyzer(registry, opts, onRecord) {
       const fullPath = (req.baseUrl || '') + routePath;
       if (internalPaths.has(fullPath)) return;
 
+      // Media type only (no header values are ever stored) plus multipart
+      // file field names populated by upload middleware (multer et al).
+      const contentType = String(req.headers['content-type'] || '')
+        .split(';')[0].trim().toLowerCase() || undefined;
+      const fileFields = [];
+      if (req.file && req.file.fieldname) fileFields.push(req.file.fieldname);
+      if (req.files) {
+        if (Array.isArray(req.files)) {
+          for (const f of req.files) if (f && f.fieldname) fileFields.push(f.fieldname);
+        } else if (typeof req.files === 'object') {
+          fileFields.push(...Object.keys(req.files));
+        }
+      }
+
       const sample = {
         body: req.body,
         query: req.query,
         params: req.params,
         status: res.statusCode,
         responseBody: captured ? responseBody : undefined,
+        contentType,
+        fileFields,
       };
       const key = routeKey(req.method, fullPath);
 

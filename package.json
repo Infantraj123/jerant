@@ -1,6 +1,6 @@
 {
   "name": "jerant",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Zero-config automatic API documentation for Express. OpenAPI 3.1 + Swagger UI served from your own app at /docs.",
   "main": "src/index.js",
   "types": "index.d.ts",
@@ -29,6 +29,15 @@
     "swagger-ui"
   ],
   "license": "MIT",
+  "author": "Infant Raj <dev@evvotechnology.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Infantraj123/jerant.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Infantraj123/jerant/issues"
+  },
+  "homepage": "https://github.com/Infantraj123/jerant#readme",
   "peerDependencies": {
     "ajv": ">=8",
     "class-validator": ">=0.14",
@@ -64,6 +73,7 @@
     "express-validator": "^7.2.1",
     "express5": "npm:express@^5.2.1",
     "joi": "^17.13.3",
+    "multer": "^2.2.0",
     "yup": "^1.6.1",
     "zod": "^3.24.1"
   }

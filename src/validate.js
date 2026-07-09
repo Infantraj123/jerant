@@ -104,6 +104,8 @@ function validate(config = {}) {
     description: config.description,
     tags: config.tags,
     deprecated: config.deprecated,
+    contentType: config.contentType,
+    files: config.files,
   };
   return middleware;
 }
@@ -128,6 +130,8 @@ function doc(config = {}) {
     description: config.description,
     tags: config.tags,
     deprecated: config.deprecated,
+    contentType: config.contentType,
+    files: config.files,
   };
   return middleware;
 }

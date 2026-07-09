@@ -22,6 +22,19 @@ export interface JerantStorageOptions {
   path?: string;
 }
 
+export interface JerantSourceScanOptions {
+  /** Scan the app's own source files for handler code that
+   * Function.prototype.toString cannot see (wrapped handlers, multer field
+   * names, named controllers). Default: true */
+  enabled?: boolean;
+  /** Directory to scan. Default: the entry script's directory. */
+  dir?: string;
+  /** Max source files read. Default: 400 */
+  maxFiles?: number;
+  /** Skip files larger than this many bytes. Default: 524288 */
+  maxFileBytes?: number;
+}
+
 export interface JerantOptions {
   /** Master switch; also disabled via JERANT_DISABLED=1. Default: true */
   enabled?: boolean;
@@ -41,6 +54,7 @@ export interface JerantOptions {
   redactKeys?: string[];
   runtime?: JerantRuntimeOptions;
   storage?: JerantStorageOptions;
+  sourceScan?: JerantSourceScanOptions;
 }
 
 export interface JerantInstance {
@@ -71,6 +85,11 @@ export interface ValidateConfig {
   description?: string;
   tags?: string[];
   deprecated?: boolean;
+  /** Request media type, e.g. 'multipart/form-data'. Auto-detected from
+   * upload middleware (multer) and observed traffic when omitted. */
+  contentType?: string;
+  /** Multipart file field names, documented as binary file inputs. */
+  files?: string[];
 }
 
 /** Install jerant on an Express app. Serves /docs and /openapi.json on the same server and port. */

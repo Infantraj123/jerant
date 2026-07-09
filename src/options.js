@@ -27,6 +27,14 @@ const DEFAULTS = {
     mode: 'memory', // 'memory' | 'file'
     path: '.jerant/data.json',
   },
+  // Scan the app's own source files for handler code that Function.toString
+  // cannot see (wrapped handlers, multer field names, named controllers).
+  sourceScan: {
+    enabled: true,
+    dir: undefined, // default: directory of the entry script
+    maxFiles: 400,
+    maxFileBytes: 512 * 1024,
+  },
 };
 
 function resolveOptions(options = {}) {
@@ -35,6 +43,7 @@ function resolveOptions(options = {}) {
     ...options,
     runtime: { ...DEFAULTS.runtime, ...(options.runtime || {}) },
     storage: { ...DEFAULTS.storage, ...(options.storage || {}) },
+    sourceScan: { ...DEFAULTS.sourceScan, ...(options.sourceScan || {}) },
   };
   if (process.env.JERANT_DISABLED === '1' || process.env.JERANT_DISABLED === 'true') {
     opts.enabled = false;

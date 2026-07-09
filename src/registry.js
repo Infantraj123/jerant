@@ -23,6 +23,8 @@ function createRouteEntry() {
     params: createNode(),
     responses: {}, // status -> node
     examples: { request: [], response: {} }, // response: status -> [examples]
+    contentTypes: {}, // request media type -> count
+    fileFields: {}, // multipart file field name -> count
     observations: 0,
   };
 }
@@ -57,6 +59,19 @@ class Registry {
     const params = sanitize(sample.params, redactKeys, maxBodyBytes);
     const responseBody = sanitize(sample.responseBody, redactKeys, maxBodyBytes);
     const status = String(sample.status || 200);
+
+    if (sample.contentType && /^[\w.+-]+\/[\w.+-]+$/.test(sample.contentType)) {
+      if (!entry.contentTypes) entry.contentTypes = {};
+      entry.contentTypes[sample.contentType] = (entry.contentTypes[sample.contentType] || 0) + 1;
+    }
+    if (Array.isArray(sample.fileFields)) {
+      if (!entry.fileFields) entry.fileFields = {};
+      for (const field of sample.fileFields.slice(0, 20)) {
+        if (typeof field === 'string' && field) {
+          entry.fileFields[field] = (entry.fileFields[field] || 0) + 1;
+        }
+      }
+    }
 
     if (body !== undefined && hasContent(body)) observe(entry.body, body);
     if (query !== undefined && hasContent(query)) observe(entry.query, query);
