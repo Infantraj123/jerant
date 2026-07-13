@@ -24,7 +24,7 @@ const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
 
 function buildApp() {
   const app = express();
-  const instance = jerant(app, { title: 'Test API', version: '9.9.9' });
+  const instance = jerant(app, { title: 'Test API', version: '9.9.9', examples: 'captured' });
   app.use(express.json());
 
   // 1. Zod-validated route

@@ -15,11 +15,15 @@ const { scanRoutes, getRootStack } = require('./scanner');
 const { buildSpec } = require('./openapi');
 const { renderDocsPage } = require('./docs-ui');
 const { createStorage } = require('./storage');
+const { createAssetsHandler } = require('./assets');
 const { instrumentMounts, patchRouterPrototype } = require('./mounts');
-const { validate, doc } = require('./validate');
+const { validate, doc, setValidationErrorDefaults } = require('./validate');
 const adapters = require('./adapters');
 
 const INSTANCE = Symbol.for('jerant.instance');
+// All live instances in this process; lets `npx jerant export` find the app.
+const INSTANCES = Symbol.for('jerant.instances');
+if (!globalThis[INSTANCES]) globalThis[INSTANCES] = [];
 
 function jerant(app, options = {}) {
   if (!app || typeof app.use !== 'function' || typeof app.get !== 'function') {
@@ -34,6 +38,8 @@ function jerant(app, options = {}) {
     return disabled;
   }
 
+  if (opts.validationError) setValidationErrorDefaults(opts.validationError);
+
   // Record router mount paths as they happen (required for Express 5,
   // where mount prefixes cannot be reconstructed from the router stack).
   instrumentMounts(app);
@@ -47,10 +53,20 @@ function jerant(app, options = {}) {
   });
   const storage = createStorage(opts.storage);
   const persisted = storage.load();
-  if (persisted) registry.loadJSON(persisted);
+  if (persisted && typeof persisted.then === 'function') {
+    // Async stores (Redis et al) hydrate the registry when they resolve.
+    persisted.then((data) => { if (data) registry.loadJSON(data); }).catch(() => {});
+  } else if (persisted) {
+    registry.loadJSON(persisted);
+  }
 
   if (opts.runtime.enabled) {
-    app.use(createAnalyzer(registry, opts, () => storage.scheduleSave(() => registry.toJSON())));
+    app.use(createAnalyzer(
+      registry,
+      opts,
+      () => storage.scheduleSave(() => registry.toJSON()),
+      () => scanRoutes(app) // tags route objects with mount prefixes; no spec build
+    ));
   }
 
   // Spec cache: routes rarely change after boot, but runtime analysis keeps
@@ -75,12 +91,18 @@ function jerant(app, options = {}) {
   openapiHandler.__jerantInternal = true;
   app.get(opts.openapiPath, openapiHandler);
 
-  const docsHtml = renderDocsPage(opts);
-  const docsHandler = (req, res) => {
-    res.type('html').send(docsHtml);
-  };
-  docsHandler.__jerantInternal = true;
-  app.get(opts.docsPath, docsHandler);
+  if (opts.assets === 'local') {
+    app.get(`${opts.docsPath}/assets/:file`, createAssetsHandler());
+  }
+
+  const docsHtml = renderDocsPage(opts); // null with ui: false (spec only)
+  if (docsHtml !== null) {
+    const docsHandler = (req, res) => {
+      res.type('html').send(docsHtml);
+    };
+    docsHandler.__jerantInternal = true;
+    app.get(opts.docsPath, docsHandler);
+  }
 
   const instance = {
     enabled: true,
@@ -92,6 +114,7 @@ function jerant(app, options = {}) {
     close: () => storage.close(),
   };
   app[INSTANCE] = instance;
+  globalThis[INSTANCES].push(instance);
   return instance;
 }
 
@@ -101,3 +124,6 @@ module.exports.default = jerant;
 module.exports.validate = validate;
 module.exports.doc = doc;
 module.exports.adapters = adapters;
+module.exports.jerantFastify = require('./frameworks/fastify').jerantFastify;
+module.exports.jerantKoa = require('./frameworks/koa').jerantKoa;
+module.exports.jerantHono = require('./frameworks/hono').jerantHono;

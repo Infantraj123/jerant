@@ -87,15 +87,28 @@ function collectAliases(src, base) {
   return aliases;
 }
 
-/** Collect field names accessed on req.<base> (body/query/params/files). */
+/** Collect field names accessed on req.<base> (body/query/params/files).
+ * `request.<base>` covers Fastify/Koa-style handler signatures. */
 function collectFields(src, base) {
   const fields = new Set();
-  const roots = [`req\\??\\.${base}`];
+  const roots = [`req\\??\\.${base}`, `request\\??\\.${base}`];
   for (const alias of collectAliases(src, base)) {
     roots.push(alias.replace(/\$/g, '\\$'));
   }
   for (const root of roots) collectFieldsOnRoot(src, root, fields);
   return fields;
+}
+
+/** Prisma models the source writes request data into:
+ * prisma.user.create({data: ...}) -> 'user'. `tx` covers $transaction blocks. */
+function collectPrismaModels(src) {
+  const models = new Set();
+  const re = /\b(?:prisma|tx)\s*\.\s*([a-zA-Z_$][\w$]*)\s*\.\s*(?:create|createMany|update|updateMany|upsert)\s*\(/g;
+  let m;
+  while ((m = re.exec(src)) && models.size < 4) {
+    if (isUsableName(m[1]) && m[1] !== '$transaction') models.add(m[1]);
+  }
+  return models;
 }
 
 function collectStatusCodes(src) {
@@ -125,6 +138,7 @@ function analyzeFunction(fn) {
         usesFiles: /(?<![\w$.])req\??\.files?\b/.test(src),
         genericFile: false,
         statusCodes: collectStatusCodes(src),
+        prismaModels: collectPrismaModels(src),
       };
       if (/(?<![\w$.])req\??\.file\b/.test(src) && result.files.size === 0) {
         result.files.add('file'); // multer .single(): field name lives in closure
@@ -151,6 +165,7 @@ function analyzeHandles(handles) {
     usesFiles: false,
     genericFile: false,
     statusCodes: new Set(),
+    prismaModels: new Set(),
   };
   for (const handle of handles || []) {
     if (typeof handle !== 'function' || handle.__jerantInternal) continue;
@@ -161,6 +176,7 @@ function analyzeHandles(handles) {
     for (const f of found.params) merged.paramsFields.add(f);
     for (const f of found.files) merged.fileFields.add(f);
     for (const s of found.statusCodes) merged.statusCodes.add(s);
+    for (const p of found.prismaModels || []) merged.prismaModels.add(p);
     if (found.usesFiles) merged.usesFiles = true;
     if (found.genericFile) merged.genericFile = true;
   }
@@ -172,6 +188,7 @@ function analyzeHandles(handles) {
     usesFiles: merged.usesFiles,
     genericFile: merged.genericFile,
     statusCodes: [...merged.statusCodes],
+    prismaModels: [...merged.prismaModels],
   };
 }
 
@@ -182,6 +199,7 @@ module.exports = {
   collectFieldsOnRoot,
   collectAliases,
   collectStatusCodes,
+  collectPrismaModels,
   destructuredNames,
   isUsableName,
 };

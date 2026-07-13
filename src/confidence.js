@@ -11,6 +11,7 @@ const SOURCE_CONFIDENCE = {
   manual: 100,
   'express-validator': 90,
   'class-validator': 90,
+  prisma: 75,
   'code-analysis': 55,
 };
 
@@ -37,6 +38,7 @@ const SOURCE_LABELS = {
   'class-validator': 'class-validator',
   manual: 'Manual',
   runtime: 'Runtime Analysis',
+  prisma: 'Prisma Schema',
   'code-analysis': 'Code Analysis',
   'runtime + code-analysis': 'Runtime Analysis + Code Analysis',
   'route-scan': 'Route Scanner',

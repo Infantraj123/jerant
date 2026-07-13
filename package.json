@@ -1,11 +1,15 @@
 {
   "name": "jerant",
-  "version": "0.1.2",
-  "description": "Zero-config automatic API documentation for Express. OpenAPI 3.1 + Swagger UI served from your own app at /docs.",
+  "version": "0.2.0",
+  "description": "Zero-config automatic API documentation for Express, Fastify, Koa and Hono. OpenAPI 3.1 + Swagger UI/Redoc/Scalar served from your own app at /docs.",
   "main": "src/index.js",
   "types": "index.d.ts",
+  "bin": {
+    "jerant": "bin/jerant.js"
+  },
   "files": [
     "src",
+    "bin",
     "index.d.ts",
     "README.md",
     "LICENSE"
@@ -18,6 +22,9 @@
   },
   "keywords": [
     "express",
+    "fastify",
+    "koa",
+    "hono",
     "openapi",
     "swagger",
     "documentation",
@@ -25,8 +32,11 @@
     "zod",
     "joi",
     "yup",
+    "prisma",
     "zero-config",
-    "swagger-ui"
+    "swagger-ui",
+    "redoc",
+    "scalar"
   ],
   "license": "MIT",
   "author": "Infant Raj <dev@evvotechnology.com>",
@@ -44,6 +54,7 @@
     "express": ">=4",
     "express-validator": ">=7",
     "joi": ">=17",
+    "swagger-ui-dist": ">=5",
     "yup": ">=1",
     "zod": ">=3"
   },
@@ -54,10 +65,16 @@
     "class-validator": {
       "optional": true
     },
+    "express": {
+      "optional": true
+    },
     "express-validator": {
       "optional": true
     },
     "joi": {
+      "optional": true
+    },
+    "swagger-ui-dist": {
       "optional": true
     },
     "yup": {
@@ -68,12 +85,17 @@
     }
   },
   "devDependencies": {
+    "@koa/router": "^15.7.0",
     "ajv": "^8.17.1",
     "express": "^4.21.2",
     "express-validator": "^7.2.1",
     "express5": "npm:express@^5.2.1",
+    "fastify": "^5.10.0",
+    "hono": "^4.12.30",
     "joi": "^17.13.3",
+    "koa": "^3.2.1",
     "multer": "^2.2.0",
+    "swagger-ui-dist": "^5.32.8",
     "yup": "^1.6.1",
     "zod": "^3.24.1"
   }

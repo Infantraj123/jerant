@@ -18,6 +18,15 @@ const {
   ROUTE_SCAN_CONFIDENCE,
 } = require('./confidence');
 const { jsonClone, pascalCase, isPlainObject } = require('./util');
+const {
+  resolveSecurity,
+  normalizeRequirement,
+  detectRouteSecurity,
+  requirementForDetected,
+} = require('./security');
+const { resolveEnvelope, applyEnvelope, envelopeAppliesTo, resolveDefaultResponses } = require('./envelope');
+const { detectRouteDrift } = require('./drift');
+const { loadPrismaSchema, modelBodySchema } = require('./prisma');
 
 const BODYLESS_METHODS = new Set(['GET', 'HEAD']);
 
@@ -84,7 +93,7 @@ function detectValidation(handles) {
           if (detected) result.responses[status] = detected;
         }
       }
-      for (const field of ['summary', 'description', 'tags', 'deprecated', 'contentType', 'files']) {
+      for (const field of ['summary', 'description', 'tags', 'deprecated', 'contentType', 'files', 'security']) {
         if (marker[field] !== undefined && result.meta[field] === undefined) {
           result.meta[field] = marker[field];
         }
@@ -177,6 +186,55 @@ function mediaType(schema, examples) {
   return media;
 }
 
+/**
+ * Type-name example generated from a schema: every leaf value is its format
+ * or type name — {email: 'email', password: 'string', age: 'number'}.
+ */
+function placeholderExample(schema, depth = 0) {
+  if (depth > 6 || !schema || typeof schema !== 'object') return 'string';
+  if (schema.const !== undefined) return schema.const;
+  if (Array.isArray(schema.enum) && schema.enum.length) return schema.enum[0];
+  const branches = schema.anyOf || schema.oneOf || schema.allOf;
+  if (Array.isArray(branches) && branches.length) {
+    return placeholderExample(branches[0], depth + 1);
+  }
+  let type = schema.type;
+  if (Array.isArray(type)) type = type.find((t) => t !== 'null') || 'null';
+  if (!type) {
+    if (schema.properties) type = 'object';
+    else if (schema.items) type = 'array';
+  }
+  switch (type) {
+    case 'object': {
+      const out = {};
+      for (const [key, child] of Object.entries(schema.properties || {})) {
+        out[key] = placeholderExample(child, depth + 1);
+      }
+      return out;
+    }
+    case 'array':
+      return [placeholderExample(schema.items || {}, depth + 1)];
+    case 'integer': return 'number';
+    case 'number': return 'float';
+    case 'boolean': return 'boolean';
+    case 'null': return null;
+    default:
+      return schema.format ? String(schema.format) : 'string';
+  }
+}
+
+/**
+ * Media object for one content type, honoring opts.examples:
+ * 'placeholder' (default) shows type-name values, 'captured' shows real
+ * (redacted) traffic payloads, false emits no example at all.
+ */
+function buildMedia(opts, schema, hoisted, captured) {
+  if (opts.examples === 'captured') return mediaType(hoisted, captured);
+  const media = { schema: hoisted };
+  if (opts.examples !== false) media.example = placeholderExample(schema);
+  return media;
+}
+
 function defaultProjectInfo() {
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8'));
@@ -198,6 +256,7 @@ function mergeScanFindings(statics, scan) {
     usesFiles: statics.usesFiles || scan.usesFiles || scan.multipart,
     genericFile: statics.genericFile,
     statusCodes: union(statics.statusCodes, scan.statusCodes),
+    prismaModels: union(statics.prismaModels || [], scan.prismaModels || []),
   };
   // Upload config in source names the real fields — drop the req.file guess.
   if (scan.fileFields.length && statics.genericFile) {
@@ -207,7 +266,17 @@ function mergeScanFindings(statics, scan) {
   return merged;
 }
 
-function buildOperation({ route, runtime, components, opts, sourceIndex }) {
+function uniqueOperationId(base, usedOperationIds) {
+  let id = base;
+  let counter = 2;
+  // '/user-profiles' and '/user/profiles' collapse to the same PascalCase
+  // name; a numeric suffix keeps every operationId unique for codegen.
+  while (usedOperationIds.has(id)) id = `${base}_${counter++}`;
+  usedOperationIds.add(id);
+  return id;
+}
+
+function buildOperation({ route, runtime, components, opts, sourceIndex, usedOperationIds, ctx }) {
   const oaPath = toOpenApiPath(route.path);
   const method = route.method.toLowerCase();
   const validation = detectValidation(route.handles);
@@ -223,7 +292,10 @@ function buildOperation({ route, runtime, components, opts, sourceIndex }) {
 
   if (validation.meta.summary) op.summary = validation.meta.summary;
   if (validation.meta.deprecated) op.deprecated = true;
-  op.operationId = componentName(route.method, oaPath, '').replace(/^(\w)/, (c) => c.toLowerCase());
+  op.operationId = uniqueOperationId(
+    componentName(route.method, oaPath, '').replace(/^(\w)/, (c) => c.toLowerCase()),
+    usedOperationIds
+  );
 
   // --- Parameters (path + query) ---
   const parameters = [];
@@ -300,6 +372,33 @@ function buildOperation({ route, runtime, components, opts, sourceIndex }) {
     };
     sources.body = 'code-analysis';
   }
+  // Prisma-aware tracing: the handler (or its service layer) writes request
+  // data into a prisma model, so schema.prisma names and types the fields.
+  if (ctx.prismaSchema && statics.prismaModels && statics.prismaModels.length &&
+      !validation.schemas.body && !BODYLESS_METHODS.has(route.method)) {
+    const modelSchema = modelBodySchema(ctx.prismaSchema, statics.prismaModels[0]);
+    if (modelSchema) {
+      if (!bodySchema) {
+        bodySchema = modelSchema;
+        sources.body = 'prisma';
+      } else if (bodySchema.type === 'object' && bodySchema.properties) {
+        // Fill in types for untyped fields; add model fields not seen yet.
+        for (const [name, fieldSchema] of Object.entries(modelSchema.properties)) {
+          const existing = bodySchema.properties[name];
+          if (!existing || Object.keys(existing).length === 0) {
+            bodySchema.properties[name] = fieldSchema;
+          }
+        }
+        if (!bodySchema.required && modelSchema.required) {
+          bodySchema.required = modelSchema.required.filter((f) => bodySchema.properties[f]);
+          if (!bodySchema.required.length) delete bodySchema.required;
+        }
+        if (sources.body && !sources.body.includes('prisma')) {
+          sources.body = `${sources.body} + prisma`;
+        }
+      }
+    }
+  }
   // Distinguish form-data uploads from raw JSON payloads. Priority:
   // explicit declaration > upload middleware on the route (multer et al)
   // > media type observed in live traffic > JSON.
@@ -339,7 +438,7 @@ function buildOperation({ route, runtime, components, opts, sourceIndex }) {
     const examples = !isMultipart && runtime ? runtime.examples.request : [];
     op.requestBody = {
       required: bodyRequired,
-      content: { [requestContentType]: mediaType(hoisted, examples) },
+      content: { [requestContentType]: buildMedia(opts, bodySchema, hoisted, examples) },
     };
   }
 
@@ -347,14 +446,19 @@ function buildOperation({ route, runtime, components, opts, sourceIndex }) {
   const responses = {};
   if (validation.responses) {
     for (const [status, detected] of Object.entries(validation.responses)) {
+      // The declared schema describes the data; the envelope (when configured)
+      // describes the wrapper every response actually ships in.
+      const schema = ctx.envelope && envelopeAppliesTo(ctx.envelope, status)
+        ? applyEnvelope(ctx.envelope, detected.schema)
+        : detected.schema;
       const hoisted = maybeHoist(
         components,
         componentName(route.method, oaPath, `Response${status}`),
-        detected.schema
+        schema
       );
       responses[status] = {
         description: statusDescription(status),
-        content: { 'application/json': mediaType(hoisted) },
+        content: { 'application/json': buildMedia(opts, schema, hoisted, []) },
       };
       sources[`response:${status}`] = detected.source;
     }
@@ -363,10 +467,12 @@ function buildOperation({ route, runtime, components, opts, sourceIndex }) {
     for (const [status, node] of Object.entries(runtime.responses)) {
       const examples = runtime.examples.response[status] || [];
       if (responses[status]) {
-        // Validation schema wins; runtime contributes real examples.
-        const media = responses[status].content['application/json'];
-        if (!media.example && !media.examples && examples.length) {
-          Object.assign(media, mediaType(media.schema, examples));
+        // Validation schema wins; captured mode lets runtime add real examples.
+        if (opts.examples === 'captured') {
+          const media = responses[status].content['application/json'];
+          if (!media.example && !media.examples && examples.length) {
+            Object.assign(media, mediaType(media.schema, examples));
+          }
         }
         continue;
       }
@@ -374,7 +480,7 @@ function buildOperation({ route, runtime, components, opts, sourceIndex }) {
       const hoisted = maybeHoist(components, componentName(route.method, oaPath, `Response${status}`), schema);
       responses[status] = {
         description: statusDescription(status),
-        content: { 'application/json': mediaType(hoisted, examples) },
+        content: { 'application/json': buildMedia(opts, schema, hoisted, examples) },
       };
       if (!sources[`response:${status}`]) sources[`response:${status}`] = 'runtime';
     }
@@ -392,12 +498,48 @@ function buildOperation({ route, runtime, components, opts, sourceIndex }) {
   if (!documentedElsewhere && !Object.keys(responses).some((s) => Number(s) < 400)) {
     responses['200'] = { description: 'Successful response' };
   }
+  // App-wide default responses (401/500 error shapes etc.) fill statuses
+  // nothing route-specific documented.
+  if (ctx.defaultResponses) {
+    for (const [status, config] of Object.entries(ctx.defaultResponses)) {
+      if (responses[status]) continue;
+      const entry = { description: config.description || statusDescription(status) };
+      if (config.schema) {
+        const schema = ctx.envelope && envelopeAppliesTo(ctx.envelope, status)
+          ? applyEnvelope(ctx.envelope, config.schema)
+          : config.schema;
+        entry.content = { 'application/json': buildMedia(opts, schema, schema, []) };
+      }
+      responses[status] = entry;
+    }
+  }
   op.responses = responses;
 
+  // --- Security ---
+  // Route-level validate({security}) wins ([] marks a public route); then
+  // auth middleware detected on the route; the app-wide default needs no
+  // per-operation entry.
+  if (validation.meta.security !== undefined) {
+    const requirement = normalizeRequirement(validation.meta.security, ctx.security.schemes);
+    if (requirement !== null) op.security = requirement;
+  } else if (ctx.security.autoDetect) {
+    const detected = detectRouteSecurity(route.handles);
+    if (detected) {
+      const requirement = requirementForDetected(detected, ctx.security.schemes);
+      if (requirement && !ctx.security.defaultRequirement) op.security = requirement;
+    }
+  }
+
+  // --- Drift (declared schema vs observed traffic) ---
+  const drift = opts.driftDetection !== false ? detectRouteDrift(validation, runtime) : [];
+
   // --- Source + confidence ---
-  const NON_VALIDATION = new Set(['runtime', 'code-analysis', 'runtime + code-analysis']);
-  const validationSources = Object.values(sources).filter((s) => !NON_VALIDATION.has(s));
-  const usedCodeAnalysis = Object.values(sources).some((s) => s.includes('code-analysis'));
+  const INFERRED = new Set(['runtime', 'code-analysis', 'prisma']);
+  const isInferred = (s) => s.split(' + ').every((part) => INFERRED.has(part));
+  const sourceValues = Object.values(sources);
+  const validationSources = sourceValues.filter((s) => !isInferred(s));
+  const usedCodeAnalysis = sourceValues.some((s) => s.split(' + ').includes('code-analysis'));
+  const usedPrisma = sourceValues.some((s) => s.split(' + ').includes('prisma'));
   const observations = runtime ? runtime.observations : 0;
   let primarySource;
   let confidence;
@@ -406,18 +548,41 @@ function buildOperation({ route, runtime, components, opts, sourceIndex }) {
     primarySource = distinct.join(' + ');
     confidence = Math.min(...distinct.map(sourceConfidence));
   } else if (observations > 0) {
-    primarySource = usedCodeAnalysis ? 'runtime + code-analysis' : 'runtime';
+    primarySource = ['runtime', usedCodeAnalysis && 'code-analysis', usedPrisma && 'prisma']
+      .filter(Boolean)
+      .join(' + ');
     const stability = Math.min(
       ...['body', 'query', 'params'].map((loc) => (runtime[loc].count ? stabilityScore(runtime[loc]) : 1)),
       ...Object.values(runtime.responses).map((n) => stabilityScore(n))
     );
     confidence = runtimeConfidence(observations, stability);
+  } else if (usedPrisma) {
+    primarySource = usedCodeAnalysis ? 'code-analysis + prisma' : 'prisma';
+    confidence = sourceConfidence('prisma');
   } else if (usedCodeAnalysis || statics.fileFields.length) {
     primarySource = 'code-analysis';
     confidence = sourceConfidence('code-analysis');
   } else {
     primarySource = 'route-scan';
     confidence = ROUTE_SCAN_CONFIDENCE;
+  }
+
+  // --- Teach mode: make low-confidence operations exercisable in the UI ---
+  // A route jerant knows little about gets an open, free-form JSON body so
+  // users can send real payloads from the docs; every request they send is
+  // observed by the analyzer and raises the confidence.
+  const teachable = opts.teachMode !== false && confidence < 50;
+  if (teachable && !op.requestBody && !BODYLESS_METHODS.has(route.method)) {
+    op.requestBody = {
+      required: false,
+      description: 'Schema not learned yet — send a real payload here and the docs will learn it.',
+      content: {
+        'application/json': {
+          schema: { type: 'object', additionalProperties: true },
+          example: {},
+        },
+      },
+    };
   }
 
   const sourceText = primarySource
@@ -435,6 +600,8 @@ function buildOperation({ route, runtime, components, opts, sourceIndex }) {
     sources,
     observations,
   };
+  if (teachable) op['x-jerant'].learning = true;
+  if (drift.length) op['x-jerant'].drift = drift;
 
   // --- Tags ---
   if (validation.meta.tags && validation.meta.tags.length) {
@@ -463,19 +630,36 @@ function buildSpec({ routes, registry, opts }) {
   const projectInfo = defaultProjectInfo();
   const components = { schemas: {} };
   const paths = {};
+  const usedOperationIds = new Set();
   let documented = 0;
   let sourceIndex = null;
   try {
     sourceIndex = loadSourceIndex(opts.sourceScan);
   } catch { /* source scanning must never break spec generation */ }
 
+  const ctx = {
+    security: resolveSecurity(opts.security),
+    envelope: resolveEnvelope(opts.envelope),
+    defaultResponses: resolveDefaultResponses(opts.defaultResponses),
+    prismaSchema: null,
+  };
+  try {
+    ctx.prismaSchema = loadPrismaSchema(opts.prisma);
+  } catch { /* prisma parsing must never break spec generation */ }
+
+  const driftSummary = [];
   for (const route of routes) {
     if (route.internal) continue;
     const runtime = registry.get(route.key);
-    const { oaPath, method, op } = buildOperation({ route, runtime, components, opts, sourceIndex });
+    const { oaPath, method, op } = buildOperation({
+      route, runtime, components, opts, sourceIndex, usedOperationIds, ctx,
+    });
     if (!paths[oaPath]) paths[oaPath] = {};
     paths[oaPath][method] = op;
     documented += 1;
+    if (op['x-jerant'].drift) {
+      driftSummary.push({ path: oaPath, method: method.toUpperCase(), issues: op['x-jerant'].drift });
+    }
   }
 
   const spec = {
@@ -489,12 +673,23 @@ function buildSpec({ routes, registry, opts }) {
   const description = opts.description || projectInfo.description;
   if (description) spec.info.description = description;
   if (opts.servers && opts.servers.length) spec.servers = jsonClone(opts.servers);
-  if (Object.keys(components.schemas).length) spec.components = components;
+  if (opts.tags) spec.tags = jsonClone(opts.tags);
+  if (Object.keys(ctx.security.schemes).length) {
+    components.securitySchemes = ctx.security.schemes;
+  }
+  if (ctx.security.defaultRequirement && ctx.security.defaultRequirement.length) {
+    spec.security = ctx.security.defaultRequirement;
+  }
+  if (Object.keys(components.schemas).length || components.securitySchemes) {
+    spec.components = components;
+    if (!Object.keys(components.schemas).length) delete components.schemas;
+  }
   spec['x-jerant'] = {
     generator: 'jerant',
     generatedAt: new Date().toISOString(),
     routes: documented,
   };
+  if (driftSummary.length) spec['x-jerant'].drift = driftSummary;
   return spec;
 }
 

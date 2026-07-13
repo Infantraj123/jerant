@@ -43,9 +43,31 @@ function checkKind(check) {
   if (check.kind) return check.kind;
   // Zod v4 stores checks as schema-like objects with their own defs.
   const def = check._zod && check._zod.def;
-  if (def) return def.check || def.format || null;
+  if (def) {
+    // v4 format checks report as {check: 'string_format', format: 'date'}.
+    if (def.check === 'string_format' && def.format) return def.format;
+    return def.check || def.format || null;
+  }
   return null;
 }
+
+// Zod format name -> JSON Schema / OpenAPI format string.
+const STRING_FORMATS = {
+  email: 'email',
+  uuid: 'uuid',
+  guid: 'uuid',
+  url: 'uri',
+  datetime: 'date-time',
+  iso_datetime: 'date-time',
+  date: 'date',
+  iso_date: 'date',
+  time: 'time',
+  iso_time: 'time',
+  duration: 'duration',
+  iso_duration: 'duration',
+  ipv4: 'ipv4',
+  ipv6: 'ipv6',
+};
 
 function checkValue(check) {
   if ('value' in check) return check.value;
@@ -63,22 +85,27 @@ function walk(schema, depth = 0) {
   switch (kind) {
     case 'string': {
       out = { type: 'string' };
+      // v4 string-format subclasses carry the format on the def itself.
+      if (def.format && STRING_FORMATS[def.format]) out.format = STRING_FORMATS[def.format];
       for (const check of def.checks || []) {
         const k = checkKind(check);
-        if (k === 'email') out.format = 'email';
-        else if (k === 'uuid' || k === 'guid') out.format = 'uuid';
-        else if (k === 'url') out.format = 'uri';
-        else if (k === 'datetime' || k === 'iso_datetime') out.format = 'date-time';
+        if (STRING_FORMATS[k]) out.format = STRING_FORMATS[k];
         else if (k === 'min' || k === 'min_length') out.minLength = checkValue(check);
         else if (k === 'max' || k === 'max_length') out.maxLength = checkValue(check);
         else if (k === 'regex' && check.regex) out.pattern = check.regex.source;
       }
       break;
     }
-    // Zod v4 top-level string formats (z.email(), z.uuid(), ...)
+    // Zod v4 top-level string formats (z.email(), z.uuid(), z.iso.date(), ...)
     case 'email': out = { type: 'string', format: 'email' }; break;
     case 'uuid': case 'guid': out = { type: 'string', format: 'uuid' }; break;
     case 'url': out = { type: 'string', format: 'uri' }; break;
+    case 'iso_date': out = { type: 'string', format: 'date' }; break;
+    case 'iso_time': out = { type: 'string', format: 'time' }; break;
+    case 'iso_datetime': out = { type: 'string', format: 'date-time' }; break;
+    case 'iso_duration': out = { type: 'string', format: 'duration' }; break;
+    case 'ipv4': out = { type: 'string', format: 'ipv4' }; break;
+    case 'ipv6': out = { type: 'string', format: 'ipv6' }; break;
     case 'number': {
       out = { type: 'number' };
       for (const check of def.checks || []) {
@@ -100,7 +127,7 @@ function walk(schema, depth = 0) {
       if (def.maxLength && def.maxLength.value != null) out.maxItems = def.maxLength.value;
       break;
     }
-    case 'object': {
+    case 'object': case 'looseobject': case 'strictobject': case 'interface': {
       const shape = typeof def.shape === 'function' ? def.shape() : def.shape || {};
       const properties = {};
       const required = [];
@@ -110,6 +137,16 @@ function walk(schema, depth = 0) {
       }
       out = { type: 'object', properties };
       if (required.length) out.required = required;
+      // z.strictObject / .strict() -> no extra keys; z.looseObject / v4
+      // passthrough -> explicit additionalProperties: true.
+      const catchallKind = def.catchall ? kindOf(def.catchall) : null;
+      if (kind === 'strictobject' || catchallKind === 'never' || def.unknownKeys === 'strict') {
+        out.additionalProperties = false;
+      } else if (kind === 'looseobject' || def.unknownKeys === 'passthrough') {
+        out.additionalProperties = true;
+      } else if (def.catchall && catchallKind && catchallKind !== 'any' && catchallKind !== 'unknown') {
+        out.additionalProperties = walk(def.catchall, depth + 1);
+      }
       break;
     }
     case 'optional': out = walk(def.innerType, depth + 1); break;
@@ -150,9 +187,16 @@ function walk(schema, depth = 0) {
       if (t === 'string' || t === 'number' || t === 'boolean') out.type = t === 'number' ? 'number' : t;
       break;
     }
-    case 'union': case 'discriminatedunion':
-      out = { anyOf: (def.options || []).map((o) => walk(o, depth + 1)) };
+    case 'union': case 'discriminatedunion': {
+      // Some Zod v3 releases store discriminatedUnion options as a Map
+      // keyed by discriminator value; normalize to an array first.
+      let options = def.options || def.optionsMap || [];
+      if (!Array.isArray(options) && typeof options.values === 'function') {
+        options = [...options.values()];
+      }
+      out = { anyOf: options.map((o) => walk(o, depth + 1)) };
       break;
+    }
     case 'intersection':
       out = { allOf: [walk(def.left, depth + 1), walk(def.right, depth + 1)] };
       break;

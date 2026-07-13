@@ -11,6 +11,31 @@ const ajvAdapter = require('./adapters/ajv');
 
 const LOCATIONS = ['params', 'query', 'body'];
 
+// App-wide default error shape, set via jerant(app, {validationError}).
+// Overridable per route with validate({..., error: {status, formatter}}).
+const errorDefaults = { status: 400, formatter: null };
+
+function setValidationErrorDefaults(config) {
+  if (!config || typeof config !== 'object') return;
+  if (Number.isInteger(config.status) && config.status >= 400 && config.status < 600) {
+    errorDefaults.status = config.status;
+  }
+  if (typeof config.formatter === 'function') errorDefaults.formatter = config.formatter;
+}
+
+function sendValidationError(res, req, details, override) {
+  const status = (override && override.status) || errorDefaults.status;
+  const formatter = (override && override.formatter) || errorDefaults.formatter;
+  let body;
+  if (formatter) {
+    try {
+      body = formatter({ details, req, status });
+    } catch { /* a broken formatter falls back to the default shape */ }
+  }
+  if (body === undefined) body = { error: 'Validation failed', details };
+  return res.status(status).json(body);
+}
+
 function buildValidator(raw) {
   if (zod.isSchema(raw)) {
     return (value) => {
@@ -79,6 +104,8 @@ function validate(config = {}) {
     responses = { 200: config.response };
   }
 
+  const errorOverride = config.error && typeof config.error === 'object' ? config.error : null;
+
   const middleware = function jerantValidate(req, res, next) {
     const details = [];
     for (const location of LOCATIONS) {
@@ -92,7 +119,7 @@ function validate(config = {}) {
       }
     }
     if (details.length) {
-      return res.status(400).json({ error: 'Validation failed', details });
+      return sendValidationError(res, req, details, errorOverride);
     }
     next();
   };
@@ -106,6 +133,7 @@ function validate(config = {}) {
     deprecated: config.deprecated,
     contentType: config.contentType,
     files: config.files,
+    security: config.security,
   };
   return middleware;
 }
@@ -132,8 +160,9 @@ function doc(config = {}) {
     deprecated: config.deprecated,
     contentType: config.contentType,
     files: config.files,
+    security: config.security,
   };
   return middleware;
 }
 
-module.exports = { validate, doc };
+module.exports = { validate, doc, setValidationErrorDefaults };

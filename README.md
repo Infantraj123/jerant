@@ -1,6 +1,8 @@
 # jerant
 
-Zero-config automatic API documentation for Express. FastAPI-style docs — OpenAPI 3.1 + Swagger UI — served from **your own app, on the same port**, with no annotations required.
+**Zero-config automatic API documentation for Express, Fastify, Koa and Hono.**
+
+FastAPI-style docs — OpenAPI 3.1 + a modern dark UI — served from **your own app, on the same port**, with no annotations required. Routes are discovered automatically, schemas are learned from your validation libraries, your Prisma schema, your source code, and real traffic.
 
 ```bash
 npm install jerant
@@ -21,33 +23,75 @@ That's it:
 | URL | What |
 | --- | --- |
 | `http://localhost:3000` | Your application, unchanged |
-| `http://localhost:3000/docs` | Swagger UI (search, try-it-out, examples) |
+| `http://localhost:3000/docs` | Interactive docs (dark purple UI, search, try-it-out, teach mode) |
 | `http://localhost:3000/openapi.json` | OpenAPI 3.1 document |
 
 No separate documentation server, no code generation step, no YAML.
 
-## How it documents your API
+---
+
+## Table of contents
+
+1. [How your API gets documented](#1-how-your-api-gets-documented)
+2. [Confidence scores & teach mode](#2-confidence-scores--teach-mode)
+3. [Validation libraries](#3-validation-libraries)
+4. [Prisma-aware tracing](#4-prisma-aware-tracing)
+5. [Authentication & the Authorize button](#5-authentication--the-authorize-button)
+6. [Custom validation errors](#6-custom-validation-errors)
+7. [Response envelopes & default responses](#7-response-envelopes--default-responses)
+8. [Example values](#8-example-values)
+9. [Tag groups](#9-tag-groups)
+10. [The docs UI](#10-the-docs-ui)
+11. [CLI: export & breaking-change guard](#11-cli-export--breaking-change-guard)
+12. [Schema drift detection](#12-schema-drift-detection)
+13. [File uploads / form-data](#13-file-uploads--form-data)
+14. [Data safety & redaction](#14-data-safety--redaction)
+15. [Storage & persistence](#15-storage--persistence)
+16. [Fastify, Koa and Hono](#16-fastify-koa-and-hono)
+17. [Full configuration reference](#17-full-configuration-reference)
+18. [Programmatic API](#18-programmatic-api)
+19. [Production notes](#19-production-notes)
+20. [Architecture](#20-architecture)
+
+---
+
+## 1. How your API gets documented
 
 jerant picks the **highest-quality schema source available** for every route, automatically:
 
-1. **Validation schemas** — Zod, Joi, Yup, AJV, express-validator, class-validator schemas found on your routes are converted to OpenAPI schemas (100% confidence).
-2. **Runtime traffic analysis** — for routes with no validation, jerant observes real requests and responses, infers schemas (types, nested objects, optional and nullable fields), and keeps improving them as more traffic flows.
-3. **Static code analysis** — for routes with no validation and no traffic yet, jerant reads your code itself: fields the handlers access (`req.body.x`, `{a, b} = req.body`, `req.query.x`), file uploads (`req.file`/`req.files.doc` → documented as `multipart/form-data` with binary fields), and response status codes (`res.status(422)`). This includes a **full project source scan** (the entry script's directory, configurable via `sourceScan`), so it also sees what live function objects hide: handlers wrapped in `asyncHandler(...)` closures, controllers referenced by name from other files, and the real upload field names configured on the route (`upload.single('avatar')`, `upload.array('photos')`, `upload.fields([{ name: 'id_front' }])`). When a handler hands the whole payload to a service (`orderService.create(req.body)`), jerant **follows the payload down to the database query** — fields read from the service's parameter, columns in SQL `INSERT INTO ... (...)` / `UPDATE ... SET`, and query-builder writes like `.insert({ status: data.status })` all become documented request fields.
-4. **Route scanning** — every route (including nested routers) appears in the docs from the moment the server starts, even before any traffic.
+| Priority | Source | Confidence | What it needs from you |
+|---|---|---|---|
+| 1 | **Validation schemas** — Zod, Joi, Yup, AJV, plain JSON Schema, class-validator | **100%** | a `validate({...})` on the route |
+| 1 | express-validator chains, class-validator classes | **90%** | nothing — detected automatically |
+| 2 | **Runtime traffic analysis** — real requests/responses observed live | **40–90%** | just use the API |
+| 3 | **Prisma schema tracing** — `prisma.user.create({data: req.body})` + `schema.prisma` | **75%** | nothing |
+| 4 | **Static code analysis** — fields your handlers read (`req.body.x`, `{a} = req.body`), status codes, upload config; includes a full project source scan that sees through wrappers, named controllers, and follows payloads down to SQL/ORM writes | **55%** | nothing |
+| 5 | **Route scanning** — every route (nested routers included) appears from the moment the server starts | **25%** | nothing |
 
-Every operation in the UI shows its **source and confidence score**:
+Every operation shows its source and confidence in the UI and carries machine-readable metadata in `x-jerant` (source, confidence, observation count, drift issues).
 
-```
-POST /users      Source: Zod               Confidence: 100%
-POST /orders     Source: Joi               Confidence: 100%
-POST /payments   Source: Runtime Analysis  Confidence: 82%
-```
+## 2. Confidence scores & teach mode
 
-## Works with your validation library
+**Raising a score is always the same move: give jerant a better source.**
+
+- Add `validate({...})` → instant **100%**
+- Handler writes into a Prisma model → **75%** automatically
+- Send real requests → climbs to **~90%** (saturates around 30 observations)
+
+**Teach mode** closes the loop from inside the docs. Any operation below 50% confidence opens automatically with a **"◌ Teach this endpoint"** panel where anyone can freely enter:
+
+- **path params** — one input per `{param}`
+- **query params** — unlimited key/value rows (no declaration needed)
+- **headers** — e.g. an `Authorization` token
+- **body** — raw JSON, form-data (with real file uploads), or url-encoded
+
+Hitting **Send request** exercises your real app; the analyzer observes the request and response, the confidence chip updates live, and a reload shows the learned schema and parameters. Once an operation crosses 50% it graduates to a normal documented endpoint. Disable with `teachMode: false`.
+
+## 3. Validation libraries
 
 ### Zod (recommended)
 
-Use the optional `validate()` helper to get real request validation *and* perfect docs from one declaration:
+`validate()` gives you real request validation *and* perfect docs from one declaration:
 
 ```js
 const { z } = require("zod");
@@ -63,19 +107,17 @@ app.post(
       email: z.string().email(),
       age: z.number().int().optional(),
     }),
-    responses: {
-      201: z.object({ id: z.number(), name: z.string() }),
-    },
+    responses: { 201: z.object({ id: z.number(), name: z.string() }) },
   }),
   (req, res) => res.status(201).json({ id: 1, name: req.body.name })
 );
 ```
 
-Invalid requests get a `400` with structured details; the docs get exact request/response schemas.
+Invalid requests get a structured error response; the docs get exact schemas. Zod v3 and v4 are both supported (including `z.iso.date()`, `z.looseObject()`, discriminated unions).
 
 ### Joi, Yup, AJV, JSON Schema, class-validator
 
-`validate()` accepts them all — jerant detects the library automatically:
+`validate()` accepts them all — the library is detected automatically:
 
 ```js
 validate({ body: Joi.object({ sku: Joi.string().required() }) })
@@ -86,38 +128,11 @@ validate({ body: { type: "object", properties: { id: { type: "integer" } } } })
 
 ### express-validator
 
-Detected automatically — no jerant code needed:
+Detected with no jerant code at all:
 
 ```js
 app.post("/subscribe", body("email").isEmail(), handler);
 // documented as { email: string (format: email), required }
-```
-
-### No validation at all
-
-Legacy apps still get useful docs. jerant's runtime analyzer watches `req.body`, `req.query`, `req.params`, response bodies and status codes, merges observations into stable schemas, and captures (redacted) example payloads:
-
-```
-Observation 1: { "name": "John" }
-Observation 2: { "name": "Alice", "age": 25 }
-Result:        name: string (required), age: integer (optional)
-```
-
-### Form-data vs raw JSON
-
-jerant documents the correct request media type per route:
-
-- Routes with upload middleware (**multer**, express-fileupload) are automatically documented as `multipart/form-data` — no traffic or config needed. The source scan recovers the actual field names from your multer config (`upload.single('avatar')`, `upload.fields([{ name: 'id_front' }])`).
-- File fields seen at runtime (`req.file`/`req.files`) appear as binary file inputs alongside the text fields from your validation schema.
-- Everything else defaults to raw `application/json`, or whatever media type live traffic actually uses.
-- Explicit control when you want it:
-
-```js
-app.post("/avatars",
-  upload.single("avatar"),
-  doc({ contentType: "multipart/form-data", files: ["avatar"] }),
-  handler
-);
 ```
 
 ### Documentation without validation
@@ -129,30 +144,277 @@ const { doc } = require("jerant");
 app.get("/reports", doc({ summary: "List reports", tags: ["reports"] }), handler);
 ```
 
-## Security
+## 4. Prisma-aware tracing
 
-jerant **never stores** authorization headers, cookies, or session identifiers (headers are not captured at all), and automatically redacts sensitive fields from stored payloads and examples — `password`, `token`, `secret`, `apiKey`, `client_secret`, credit-card fields, and anything that *looks* like a credential (JWTs, `Bearer …` values):
+When a handler — or the service function it calls — writes request data into a Prisma model, jerant reads `schema.prisma` and types the body fields from the model:
+
+```js
+app.post("/users", async (req, res) => {
+  const user = await prisma.user.create({ data: req.body });
+  res.status(201).json(user);
+});
+// documented from schema.prisma: email (string, required), name (string,
+// required), age (integer), role (enum ADMIN|MEMBER)
+```
+
+Server-managed columns are excluded automatically: `@id`, `@updatedAt`, and generated defaults (`now()`, `autoincrement()`, `uuid()`). Fields with literal defaults (`@default(MEMBER)`) are documented as optional. Configure with `prisma: { schemaPath: "db/schema.prisma" }`, disable with `prisma: { enabled: false }`.
+
+## 5. Authentication & the Authorize button
+
+Declare your auth model once — every operation documents it and Swagger UI shows its **Authorize** button:
+
+```js
+jerant(app, { security: "bearer" });   // or "apiKey", "basic", "cookie"
+```
+
+Mark exceptions per route (`security: []` = public):
+
+```js
+app.post("/login", validate({ security: [] }), loginHandler);
+```
+
+Full control:
+
+```js
+jerant(app, {
+  security: {
+    schemes: {
+      bearerAuth: { type: "http", scheme: "bearer", bearerFormat: "JWT" },
+      apiKeyAuth: { type: "apiKey", in: "header", name: "X-Service-Key" },
+    },
+    default: "bearerAuth",
+  },
+});
+```
+
+With no configuration at all, jerant **auto-detects auth middleware** from its source — `req.headers.authorization` reads, `Bearer` checks, `passport.authenticate(...)`, `x-api-key` lookups, or middleware named `requireAuth`/`isAuthenticated`/etc. — and documents those routes as secured. Disable with `security: false` or `security: { autoDetect: false }`.
+
+## 6. Custom validation errors
+
+The default failure response is `400 {error, details}`. Reshape it app-wide:
+
+```js
+jerant(app, {
+  validationError: {
+    status: 422,
+    formatter: ({ details }) => ({ success: false, errors: details }),
+  },
+});
+```
+
+…or per route: `validate({ body: schema, error: { status: 422 } })`.
+
+## 7. Response envelopes & default responses
+
+If every response ships in a wrapper, declare it once — declared response schemas slot into `$data` automatically:
+
+```js
+jerant(app, {
+  envelope: { success: "boolean", message: "string", data: "$data" },
+  defaultResponses: {
+    401: { description: "Not signed in", schema: { type: "object", properties: { error: { type: "string" } } } },
+    500: { description: "Internal error" },
+  },
+});
+```
+
+`defaultResponses` are added to every operation that doesn't already document that status. The envelope also accepts a full JSON Schema containing a `"$data"` slot, plus `{ schema, statuses: [200, 201] }` to control which statuses get wrapped (default: all 2xx).
+
+## 8. Example values
+
+Every request/response body carries an example whose values are the **type names** — instant, self-explanatory, and guaranteed to never leak data:
+
+```json
+{ "email": "email", "password": "string", "age": "number", "score": "float" }
+```
+
+| `examples` option | Behavior |
+|---|---|
+| `"placeholder"` (default) | type-name values as above |
+| `"captured"` | real (redacted) traffic payloads |
+| `false` | no examples |
+
+## 9. Tag groups
+
+Give the sidebar groups descriptions and a fixed order:
+
+```js
+jerant(app, {
+  tags: [
+    { name: "users", description: "User management" },
+    { name: "orders", description: "Order processing" },
+    "internal",
+  ],
+});
+```
+
+Routes without explicit tags are grouped by their first meaningful path segment (`/api/v1/users/…` → `users`).
+
+## 10. The docs UI
+
+The default UI is a **modern dark theme** (deep purple surfaces, lavender accents) with:
+
+- a **stats header**: endpoints, tag groups, schemas, average confidence, drift issues, and endpoints still in learning mode
+- **per-operation confidence chips** — color-graded score with source, observation count and drift warnings on hover
+- **Expand all / Collapse all**, **Copy spec URL**, **Download JSON** buttons
+- **`/`** keyboard shortcut to jump to the endpoint search
+- **teach panels** on low-confidence operations (see [§2](#2-confidence-scores--teach-mode))
+- validated color palette (contrast + colorblind-safe method badges on the dark surface)
+
+### Choosing a UI
+
+```js
+jerant(app, { ui: "swagger" });   // default
+jerant(app, { ui: "redoc" });     // Redoc, same dark purple theme
+jerant(app, { ui: "scalar" });    // Scalar, purple dark mode
+```
+
+### Self-hosting the assets (offline / strict CSP)
+
+```bash
+npm install swagger-ui-dist
+```
+
+```js
+jerant(app, { assets: "local" });   // served at /docs/assets/*, allowlisted
+```
+
+### Bring your own UI
+
+```js
+jerant(app, { ui: false });                    // serve only /openapi.json
+app.get("/mydocs", (req, res) => res.sendFile("my-ui.html"));
+
+jerant(app, { ui: { html: myHtmlString } });   // your page at docsPath
+
+jerant(app, {                                  // or a render function
+  ui: ({ openapiPath, title }) => `<html>… fetch("${openapiPath}") …</html>`,
+});
+```
+
+Any custom UI gets the full spec including the `x-jerant` metadata (source, confidence, drift), so you can render your own badges.
+
+## 11. CLI: export & breaking-change guard
+
+```bash
+npx jerant export server.js -o openapi.json      # CI / codegen / Postman
+npx jerant diff openapi.main.json openapi.json   # exits 1 on breaking changes
+npx jerant diff main-server.js server.js         # app entries work too
+```
+
+- **`export`** loads your app (with `JERANT_EXPORT=1` set, so you can skip `listen()` if you want) and writes the full OpenAPI document. `--wait <ms>` allows extra time for async route registration; `--pretty` formats stdout output.
+- **`diff`** reports **breaking changes** — removed operations, new required request fields/params, type changes, removed response properties — and exits `1` when any are found (`--fail-on any` also fails on additions). Wire it into CI to block accidental breakage.
+
+## 12. Schema drift detection
+
+When a route has a declared schema *and* enough observed traffic (≥5 requests), jerant compares the two and flags mismatches:
+
+- **type-mismatch** — declared `number`, traffic shows `string`
+- **required-field-never-observed** — declared required, absent from every payload
+- **undeclared-field** — appears in traffic but the schema forbids extras
+
+Findings land in `x-jerant.drift` per operation with a spec-level summary; drifting operations show a **⚠** on their confidence chip. Disable with `driftDetection: false`.
+
+## 13. File uploads / form-data
+
+jerant documents the correct request media type per route:
+
+- Routes with upload middleware (**multer**, express-fileupload) are documented as `multipart/form-data` automatically; the source scan recovers real field names from your config (`upload.single('avatar')`, `upload.fields([{ name: 'id_front' }])`).
+- File fields seen at runtime (`req.file` / `req.files`) appear as binary inputs alongside schema fields.
+- Explicit control when you want it:
+
+```js
+app.post("/avatars",
+  upload.single("avatar"),
+  doc({ contentType: "multipart/form-data", files: ["avatar"] }),
+  handler
+);
+```
+
+## 14. Data safety & redaction
+
+jerant **never stores** authorization headers, cookies, or session identifiers (headers are not captured at all), and automatically redacts sensitive fields from stored payloads and examples — `password`, `token`, `secret`, `apiKey`, credit-card fields, and anything that *looks* like a credential (JWTs, `Bearer …` values):
 
 ```json
 { "password": "***REDACTED***" }
 ```
 
-Add your own fields with `redactKeys: ["internal_code"]`.
+Add your own with `redactKeys: ["internal_code"]`. With the default `examples: "placeholder"`, stored payloads never surface in the docs at all.
 
-## Configuration
+## 15. Storage & persistence
+
+Learned schemas live in memory by default. To survive restarts:
+
+```js
+jerant(app, { storage: { mode: "file", path: ".jerant/data.json" } });
+```
+
+Multiple instances behind a load balancer should share a store instead — anything with `load()`/`save()` works (both may be async):
+
+```js
+jerant(app, {
+  storage: {
+    mode: "custom",
+    store: {
+      load: async () => JSON.parse(await redis.get("jerant") || "null"),
+      save: async (data) => redis.set("jerant", JSON.stringify(data)),
+    },
+  },
+});
+```
+
+Writes are debounced and atomic (file mode), with a flush on process exit.
+
+## 16. Fastify, Koa and Hono
+
+The core is framework-agnostic; adapters ship in the box and provide the same docs, runtime learning, and UI:
+
+```js
+// Fastify — route schemas become first-class docs (call before routes)
+const { jerantFastify } = require("jerant");
+jerantFastify(fastify);
+
+// Koa — pass your @koa/router instance(s)
+const { jerantKoa } = require("jerant");
+jerantKoa(app, { routers: [router] });
+
+// Hono — call before registering routes
+const { jerantHono } = require("jerant");
+jerantHono(app);
+```
+
+## 17. Full configuration reference
 
 Everything is optional:
 
 ```js
 jerant(app, {
-  title: "My API",                 // default: your package.json name
-  version: "2.0.0",                // default: your package.json version
+  // Identity (defaults come from your package.json)
+  title: "My API",
+  version: "2.0.0",
   description: "…",
+  servers: [{ url: "https://api.example.com" }],
+
+  // Paths
   docsPath: "/docs",
   openapiPath: "/openapi.json",
-  servers: [{ url: "https://api.example.com" }],
-  redactKeys: ["internal_id"],     // extra fields to redact
-  cdn: "https://unpkg.com/swagger-ui-dist@5", // self-host if you prefer
+
+  // UI
+  ui: "swagger",                   // "redoc" | "scalar" | false | {html} | (ctx) => html
+  assets: "cdn",                   // "local" = self-hosted swagger-ui-dist
+  cdn: "https://unpkg.com/swagger-ui-dist@5",
+
+  // Documentation behavior
+  security: "bearer",              // auth modeling + Authorize button (§5)
+  validationError: { status: 422 },// validate() failure shape (§6)
+  envelope: { success: "boolean", data: "$data" },   // §7
+  defaultResponses: { 500: { description: "Internal error" } },
+  tags: [{ name: "users", description: "User management" }],
+  examples: "placeholder",         // "captured" | false (§8)
+  teachMode: true,                 // open low-confidence ops for learning (§2)
+  driftDetection: true,            // §12
+
+  // Learning engine
   runtime: {
     enabled: true,                 // runtime traffic analysis
     sampleRate: 1,                 // sample a fraction of requests
@@ -160,30 +422,54 @@ jerant(app, {
     maxObservations: 1000,         // merge cap per route
     maxBodyBytes: 102400,          // skip larger payloads
   },
-  storage: {
-    mode: "memory",                // or "file" to survive restarts
-    path: ".jerant/data.json",
-  },
+  sourceScan: { enabled: true },   // project source analysis
+  prisma: { enabled: true },       // schema.prisma tracing (§4)
+
+  // Data safety
+  redactKeys: ["internal_id"],
+
+  // Persistence (§15)
+  storage: { mode: "memory" },     // "file" | "custom"
 });
 ```
 
 Disable entirely with `enabled: false` or the `JERANT_DISABLED=1` environment variable.
 
-The returned instance gives you programmatic access:
+## 18. Programmatic API
 
 ```js
 const docs = jerant(app);
-docs.getSpec();   // current OpenAPI document
+docs.getSpec();   // current OpenAPI document (cached)
 docs.refresh();   // force a rebuild
-docs.flush();     // persist learned schemas now (file mode)
+docs.flush();     // persist learned schemas now
+docs.close();     // stop persistence timers
 ```
 
-## Notes for production
+## 19. Production notes
 
-- **Overhead**: the middleware only wraps `res.json`/`res.send` and defers all analysis to `setImmediate` after the response is sent — nothing blocks the request path. Use `runtime.sampleRate` to sample under heavy load.
-- **Call order**: call `jerant(app)` right after `express()` (before your body parser and routes) so the analyzer sees every response. Routes are discovered lazily, so registration order of *routes* doesn't matter.
-- **CSP**: the `/docs` page loads Swagger UI assets from a CDN and uses an inline script. If you run a strict Content-Security-Policy (e.g. helmet), allow the `cdn` origin or point `cdn` at self-hosted `swagger-ui-dist` assets.
-- **Persistence**: `storage.mode: "file"` writes learned schemas with debounced atomic writes and flushes on exit, so runtime-inferred docs survive restarts.
+- **Overhead**: the middleware only wraps `res.json`/`res.send` (restored after each response) and defers all analysis to `setImmediate` after the response is sent — nothing blocks the request path. Use `runtime.sampleRate` to sample under heavy load.
+- **Call order**: call `jerant(app)` right after `express()` (before your body parser and routes) so the analyzer sees every response. Route *registration* order doesn't matter — discovery is lazy.
+- **CSP**: the `/docs` page loads UI assets from a CDN by default and uses an inline script. Under a strict Content-Security-Policy use `assets: "local"` or allow the `cdn` origin.
+- **CI**: `npx jerant export` + `npx jerant diff` give you spec artifacts and a breaking-change gate without booting a server in tests.
+
+## 20. Architecture
+
+```
+Express / Fastify / Koa / Hono App
+    │
+Route Scanner ──► discovers every route & nested router
+    │
+    ├── Validation Adapters (Zod / Joi / Yup / AJV / express-validator / class-validator)
+    ├── Prisma Schema Tracing (schema.prisma → typed body fields)
+    └── Runtime Analyzer ──► Schema Inference Engine (+ redaction, confidence, drift)
+    │
+OpenAPI 3.1 Generator (security, envelopes, tags, default responses, teach mode)
+    │
+    ├── /openapi.json          (also: npx jerant export / diff)
+    └── /docs (dark UI: Swagger / Redoc / Scalar / your own)
+```
+
+Schema adapters and framework adapters both operate on plain instances — nothing in jerant imports a web framework.
 
 ## Examples
 
@@ -192,30 +478,10 @@ node examples/zod-app.js      # modern app with Zod validation
 node examples/legacy-app.js   # legacy app, docs learned from traffic
 ```
 
-## Architecture
-
-```
-Express App
-    │
-Route Scanner ──► discovers every route & nested router
-    │
-    ├── Validation Adapters (Zod / Joi / Yup / AJV / express-validator / class-validator)
-    └── Runtime Analyzer ──► Schema Inference Engine (+ redaction, confidence)
-    │
-OpenAPI 3.1 Generator
-    │
-    ├── /openapi.json
-    └── /docs (Swagger UI)
-```
-
-The adapter system is extensible, and the core (scanner → registry → generator) is framework-agnostic by design — Fastify, Koa, NestJS and Hono adapters are on the roadmap.
-
 ## Roadmap
 
-- **Phase 1 (now)**: Express, Zod, Joi, Yup, AJV, express-validator, class-validator, runtime analysis, Swagger UI, file persistence
-- **Phase 2**: TypeScript metadata, database persistence
-- **Phase 3**: Fastify, Koa, NestJS, Hono
-- **Phase 4**: API version comparison & change tracking, SDK generation
+- **Done**: Express/Fastify/Koa/Hono · all major validation libraries · runtime learning + teach mode · security modeling · envelopes & default responses · drift detection · Prisma tracing · export/diff CLI · pluggable storage · dark UI with Swagger/Redoc/Scalar/custom
+- **Next**: NestJS adapter, TypeScript metadata, SDK generation
 
 ## License
 

@@ -1,0 +1,37 @@
+// Fixture schema for prisma-aware tracing tests.
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  MEMBER
+}
+
+model User {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  name      String
+  age       Int?
+  role      Role     @default(MEMBER)
+  posts     Post[]
+  profile   Profile? @relation(fields: [profileId], references: [id])
+  profileId Int?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Post {
+  id       Int    @id @default(autoincrement())
+  title    String
+  author   User   @relation(fields: [authorId], references: [id])
+  authorId Int
+}
+
+model Profile {
+  id   Int    @id @default(autoincrement())
+  bio  String?
+  user User[]
+}

@@ -18,6 +18,7 @@ const {
   collectFieldsOnRoot,
   collectAliases,
   collectStatusCodes,
+  collectPrismaModels,
   destructuredNames,
   isUsableName,
 } = require('./static-analysis');
@@ -380,7 +381,7 @@ function collectDbFields(src, root, addField) {
 
 /** Follow the payload through service calls, collecting body fields from
  * each callee's parameter usage and from DB write statements. */
-function trackPayloadFlow(files, initialTexts, addBodyField) {
+function trackPayloadFlow(files, initialTexts, addBodyField, onSource) {
   const visited = new Set();
   let queue = initialTexts.map((src) => ({ src, roots: bodyRootNames(src) }));
   for (let hop = 0; hop < MAX_FLOW_HOPS && queue.length; hop++) {
@@ -393,6 +394,7 @@ function trackPayloadFlow(files, initialTexts, addBodyField) {
           visited.add(name);
           const def = findFunctionDefinition(files, name);
           if (!def) continue;
+          if (onSource) onSource(def.body);
           const param = (splitTopLevel(def.params)[argIndex] || '').trim();
           if (!param) continue;
           if (param.startsWith('{')) {
@@ -422,6 +424,7 @@ function analyzeRegistrations(files, registrations) {
     usesFiles: false,
     multipart: false,
     statusCodes: new Set(),
+    prismaModels: new Set(),
   };
   const sourceTexts = [];
   const seenHandlers = new Set();
@@ -435,6 +438,9 @@ function analyzeRegistrations(files, registrations) {
       if (def) sourceTexts.push(def.body);
     }
   }
+  const collectPrisma = (src) => {
+    for (const model of collectPrismaModels(src)) found.prismaModels.add(model);
+  };
   for (const src of sourceTexts) {
     for (const f of collectFields(src, 'body')) found.bodyFields.add(f);
     for (const f of collectFields(src, 'query')) found.queryFields.add(f);
@@ -442,13 +448,14 @@ function analyzeRegistrations(files, registrations) {
     for (const f of collectFields(src, 'files')) found.fileFields.add(f);
     for (const s of collectStatusCodes(src)) found.statusCodes.add(s);
     if (/(?<![\w$.])req\??\.files?\b/.test(src)) found.usesFiles = true;
+    collectPrisma(src);
   }
   // Handlers that hand the whole payload to a service: follow it down to
   // the DB query to learn the field names.
   const addBodyField = (name) => {
     if (found.bodyFields.size < 40 && isUsableName(name)) found.bodyFields.add(name);
   };
-  trackPayloadFlow(files, sourceTexts, addBodyField);
+  trackPayloadFlow(files, sourceTexts, addBodyField, collectPrisma);
   return {
     bodyFields: [...found.bodyFields],
     queryFields: [...found.queryFields],
@@ -457,6 +464,7 @@ function analyzeRegistrations(files, registrations) {
     usesFiles: found.usesFiles,
     multipart: found.multipart,
     statusCodes: [...found.statusCodes],
+    prismaModels: [...found.prismaModels],
   };
 }
 

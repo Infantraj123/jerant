@@ -5,29 +5,45 @@
 // setImmediate after the response has finished — nothing blocks the
 // request path.
 
-const { routeKey } = require('./scanner');
+const { routeKey, ROUTE_PREFIX } = require('./scanner');
+const { joinPaths } = require('./util');
 
-function createAnalyzer(registry, opts, onRecord) {
+// Guards against instrumenting the same response twice (jerant installed on
+// both an app and a mounted router, re-entry via next('route'), ...).
+const INSTRUMENTED = Symbol.for('jerant.resInstrumented');
+
+function createAnalyzer(registry, opts, onRecord, onFirstRequest) {
   const sampleRate = opts.runtime.sampleRate;
   const internalPaths = new Set([opts.docsPath, opts.openapiPath]);
+  let firstRequestSeen = false;
 
   const analyzer = function jerantAnalyzer(req, res, next) {
+    if (!firstRequestSeen) {
+      firstRequestSeen = true;
+      // Trigger an initial route scan off the request path so route objects
+      // carry their mount prefix before observations are keyed.
+      if (onFirstRequest) setImmediate(() => { try { onFirstRequest(); } catch { /* best-effort */ } });
+    }
+    if (res[INSTRUMENTED]) return next();
     if (sampleRate < 1 && Math.random() > sampleRate) return next();
+    res[INSTRUMENTED] = true;
 
     let responseBody;
     let captured = false;
 
     const originalJson = res.json;
-    res.json = function json(body) {
+    const wrappedJson = function json(body) {
       if (!captured) {
         responseBody = body;
         captured = true;
       }
+      restore();
       return originalJson.call(this, body);
     };
+    res.json = wrappedJson;
 
     const originalSend = res.send;
-    res.send = function send(body) {
+    const wrappedSend = function send(body) {
       if (!captured) {
         if (typeof body === 'string') {
           const type = String(this.get('Content-Type') || '');
@@ -42,10 +58,21 @@ function createAnalyzer(registry, opts, onRecord) {
           captured = true;
         }
       }
+      restore();
       return originalSend.call(this, body);
     };
+    res.send = wrappedSend;
+
+    // Put the original methods back once we have what we need. Only our own
+    // wrappers are removed — if another library patched on top of them,
+    // its patch is left untouched.
+    function restore() {
+      if (res.json === wrappedJson) res.json = originalJson;
+      if (res.send === wrappedSend) res.send = originalSend;
+    }
 
     res.on('finish', () => {
+      restore();
       const route = req.route;
       if (!route) return; // unmatched request (404 etc.)
       const handlerStack = route.stack || [];
@@ -53,7 +80,13 @@ function createAnalyzer(registry, opts, onRecord) {
 
       const routePath = Array.isArray(route.path) ? route.path[0] : route.path;
       if (typeof routePath !== 'string') return;
-      const fullPath = (req.baseUrl || '') + routePath;
+      // Prefer the mount prefix recorded at scan time: req.baseUrl contains
+      // resolved param values (/users/42), which would never match the
+      // scanned pattern key (/users/:id).
+      const prefix = route[ROUTE_PREFIX];
+      const fullPath = prefix !== undefined
+        ? joinPaths(prefix, routePath)
+        : (req.baseUrl || '') + routePath;
       if (internalPaths.has(fullPath)) return;
 
       // Media type only (no header values are ever stored) plus multipart

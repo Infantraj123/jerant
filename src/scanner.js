@@ -7,6 +7,11 @@
 const { joinPaths, normalizePath } = require('./util');
 const { instrumentMounts } = require('./mounts');
 
+// Mount prefix recorded on route objects during scanning so the runtime
+// analyzer can rebuild the exact scan-time key (req.baseUrl contains real
+// param values, e.g. /users/42, which would orphan observations).
+const ROUTE_PREFIX = Symbol.for('jerant.routePrefix');
+
 function getRootStack(app) {
   if (app._router && Array.isArray(app._router.stack)) return app._router.stack;
   if (typeof app.lazyrouter === 'function') {
@@ -57,16 +62,39 @@ function layerMountPath(layer) {
   return src;
 }
 
+/**
+ * Best-effort mount path for regex mounts that cannot be reversed exactly
+ * (app.use(/^\/v[12]/, router)). The raw pattern is kept in the path so the
+ * routes still appear in the docs instead of silently vanishing.
+ */
+function fallbackMountPath(layer) {
+  const regexp = layer.regexp;
+  if (!regexp || !regexp.source) return '';
+  const src = regexp.source
+    .replace(/^\^/, '')
+    .replace(/\\\/\?\(\?=\\\/\|\$\)$/, '')
+    .replace(/\(\?=\\\/\|\$\)$/, '')
+    .replace(/\(\?:\\\/\)\?$/, '')
+    .replace(/\\\/\?$/, '')
+    .replace(/\$$/, '')
+    .replace(/\\\//g, '/');
+  return src;
+}
+
 function routePaths(route) {
   return Array.isArray(route.path) ? route.path : [route.path];
 }
 
+// Methods an OpenAPI path item can express (TRACE excluded as noise).
+const OPENAPI_METHODS = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options'];
+
 function routeMethods(route) {
   const methods = Object.keys(route.methods || {}).filter((m) => route.methods[m]);
-  if (methods.includes('_all')) {
-    return ['get', 'post', 'put', 'patch', 'delete'];
-  }
-  return methods;
+  // router.all() marks the route '_all'; app.all() on Express 4 registers
+  // every Node HTTP method (ACL, PROPFIND, ...) individually. Either way,
+  // document the full OpenAPI-expressible set and nothing more.
+  if (methods.includes('_all')) return [...OPENAPI_METHODS];
+  return methods.filter((m) => OPENAPI_METHODS.includes(m));
 }
 
 /**
@@ -83,6 +111,7 @@ function scanRoutes(app) {
       if (layer.route) {
         const handles = (layer.route.stack || []).map((l) => l.handle).filter(Boolean);
         const internal = handles.some((h) => h && h.__jerantInternal);
+        if (layer.route[ROUTE_PREFIX] === undefined) layer.route[ROUTE_PREFIX] = prefix;
         for (const path of routePaths(layer.route)) {
           if (typeof path !== 'string') continue;
           const fullPath = joinPaths(prefix, path);
@@ -107,8 +136,8 @@ function scanRoutes(app) {
           ? (Array.isArray(recorded) ? recorded : [recorded])
           : [layerMountPath(layer)];
         for (const mount of mounts) {
-          if (mount === null) continue; // unreconstructable regex mount
-          walk(layer.handle.stack, joinPaths(prefix, mount), depth + 1);
+          const resolved = mount === null ? fallbackMountPath(layer) : mount;
+          walk(layer.handle.stack, joinPaths(prefix, resolved), depth + 1);
         }
         instrumentMounts(layer.handle); // future mounts on this router get recorded
       }
@@ -123,4 +152,4 @@ function routeKey(method, path) {
   return `${String(method).toUpperCase()} ${normalizePath(path)}`;
 }
 
-module.exports = { scanRoutes, getRootStack, routeKey, layerMountPath };
+module.exports = { scanRoutes, getRootStack, routeKey, layerMountPath, ROUTE_PREFIX };
