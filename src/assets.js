@@ -3,6 +3,11 @@
 // Self-hosted UI assets: serves swagger-ui-dist from node_modules under
 // `${docsPath}/assets/*` so the docs work offline and under strict CSPs.
 // Only an allowlisted set of file names is ever readable — no traversal.
+//
+// Files are read once and kept in memory (with ETag + compressed variants).
+// The docs page links them as `...?v=<swagger-ui-dist version>`; only such
+// versioned URLs are cached as immutable — a bare URL must revalidate,
+// because its content changes when swagger-ui-dist is upgraded.
 
 const fs = require('fs');
 const path = require('path');
@@ -27,38 +32,59 @@ const CONTENT_TYPES = {
   '.png': 'image/png',
 };
 
-function resolveDistDir() {
+const IMMUTABLE = 'public, max-age=31536000, immutable';
+const REVALIDATE = 'public, max-age=0, must-revalidate';
+
+function resolveDist() {
   try {
-    return path.dirname(require.resolve('swagger-ui-dist/package.json'));
+    const pkgFile = require.resolve('swagger-ui-dist/package.json');
+    const version = JSON.parse(fs.readFileSync(pkgFile, 'utf8')).version || null;
+    return { dir: path.dirname(pkgFile), version };
   } catch {
     return null;
   }
 }
 
-/** Express handler for GET `${docsPath}/assets/:file`. */
-function createAssetsHandler() {
-  const distDir = resolveDistDir();
-
-  const handler = (req, res) => {
-    const file = req.params.file;
-    if (!distDir) {
-      return res.status(500).type('text').send(
-        'jerant: assets: "local" requires the swagger-ui-dist package — npm install swagger-ui-dist'
-      );
-    }
-    if (!file || !ALLOWED_FILES.has(file)) {
-      return res.status(404).type('text').send('Not found');
-    }
-    const fullPath = path.join(distDir, file);
-    fs.readFile(fullPath, (err, data) => {
-      if (err) return res.status(404).type('text').send('Not found');
-      res.set('Content-Type', CONTENT_TYPES[path.extname(file)] || 'application/octet-stream');
-      res.set('Cache-Control', 'public, max-age=86400, immutable');
-      res.send(data);
-    });
-  };
-  handler.__jerantInternal = true;
-  return handler;
+/** swagger-ui-dist version used to fingerprint asset URLs (null if absent). */
+function assetVersion() {
+  const dist = resolveDist();
+  return dist ? dist.version : null;
 }
 
-module.exports = { createAssetsHandler };
+function createAssetsService() {
+  // Lazy-required to avoid a circular import (serve.js requires us).
+  const { Resource } = require('./serve');
+  const dist = resolveDist();
+  const cache = new Map(); // `${file}|${immutable}` -> Promise<Resource|null>
+
+  return {
+    version: dist ? dist.version : null,
+    /** Resource for an allowlisted file, null when unknown, {error} when the package is missing. */
+    get(file, requestedVersion) {
+      if (!dist) {
+        return {
+          status: 500,
+          error: 'jerant: assets: "local" requires the swagger-ui-dist package — npm install swagger-ui-dist',
+        };
+      }
+      if (!file || !ALLOWED_FILES.has(file)) return null;
+      const immutable = !!requestedVersion && requestedVersion === dist.version;
+      const key = `${file}|${immutable}`;
+      let pending = cache.get(key);
+      if (!pending) {
+        pending = fs.promises.readFile(path.join(dist.dir, file)).then(
+          (data) => new Resource(
+            data,
+            CONTENT_TYPES[path.extname(file)] || 'application/octet-stream',
+            immutable ? IMMUTABLE : REVALIDATE
+          ),
+          () => { cache.delete(key); return null; }
+        );
+        cache.set(key, pending);
+      }
+      return pending;
+    },
+  };
+}
+
+module.exports = { createAssetsService, assetVersion, ALLOWED_FILES };

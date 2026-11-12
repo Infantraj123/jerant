@@ -1,6 +1,6 @@
 'use strict';
 
-// OpenAPI 3.1 generator: joins scanned routes, detected validation schemas,
+// OpenAPI generator (3.1 internally, downgraded to 3.0 by default): joins scanned routes, detected validation schemas,
 // and runtime-inferred schemas into a single document, picking the highest
 // quality source per location and annotating every operation with its
 // source and confidence.
@@ -27,6 +27,7 @@ const {
 const { resolveEnvelope, applyEnvelope, envelopeAppliesTo, resolveDefaultResponses } = require('./envelope');
 const { detectRouteDrift } = require('./drift');
 const { loadPrismaSchema, modelBodySchema } = require('./prisma');
+const { toOpenApi30 } = require('./downgrade');
 
 const BODYLESS_METHODS = new Set(['GET', 'HEAD']);
 
@@ -235,13 +236,51 @@ function buildMedia(opts, schema, hoisted, captured) {
   return media;
 }
 
+let projectInfoCache = null;
 function defaultProjectInfo() {
+  const file = path.join(process.cwd(), 'package.json');
+  if (projectInfoCache && projectInfoCache.file === file) return projectInfoCache.info;
+  let info = {};
   try {
-    const pkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8'));
-    return { title: pkg.name, version: pkg.version, description: pkg.description };
-  } catch {
-    return {};
+    const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
+    info = { title: pkg.name, version: pkg.version, description: pkg.description };
+  } catch { /* no package.json */ }
+  projectInfoCache = { file, info };
+  return info;
+}
+
+function sameHandles(a, b) {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/**
+ * Route analysis that only depends on the handler functions (validation
+ * schema detection, handler-source mining). It is by far the most expensive
+ * part of a build, so it is cached per route across rebuilds and recomputed
+ * only when the route's handler list changes.
+ */
+function routeAnalysis(route, sourceIndex, routeCache) {
+  const cached = routeCache && routeCache.get(route.key);
+  if (cached && sameHandles(cached.handles, route.handles) && cached.sourceIndex === sourceIndex) {
+    return cached;
   }
+  const entry = {
+    handles: route.handles,
+    sourceIndex,
+    validation: detectValidation(route.handles),
+    // Deepest fallback: mine the handler source for fields the code actually
+    // reads (req.body.x, req.query.x, req.files.doc, res.status codes), both
+    // from the live function objects and from the project's source files.
+    statics: mergeScanFindings(
+      analyzeHandles(route.handles),
+      scanRouteSource(sourceIndex, route.method, route.path)
+    ),
+  };
+  if (routeCache) routeCache.set(route.key, entry);
+  return entry;
 }
 
 /** Fold project-source findings into the per-function analysis result. */
@@ -279,14 +318,9 @@ function uniqueOperationId(base, usedOperationIds) {
 function buildOperation({ route, runtime, components, opts, sourceIndex, usedOperationIds, ctx }) {
   const oaPath = toOpenApiPath(route.path);
   const method = route.method.toLowerCase();
-  const validation = detectValidation(route.handles);
-  // Deepest fallback: mine the handler source for fields the code actually
-  // reads (req.body.x, req.query.x, req.files.doc, res.status codes), both
-  // from the live function objects and from the project's source files.
-  const statics = mergeScanFindings(
-    analyzeHandles(route.handles),
-    scanRouteSource(sourceIndex, route.method, route.path)
-  );
+  const { validation, statics: cachedStatics } = routeAnalysis(route, sourceIndex, ctx.routeCache);
+  // Shallow copies: per-build edits must never leak into the route cache.
+  const statics = { ...cachedStatics };
   const op = {};
   const sources = {};
 
@@ -499,18 +533,11 @@ function buildOperation({ route, runtime, components, opts, sourceIndex, usedOpe
     responses['200'] = { description: 'Successful response' };
   }
   // App-wide default responses (401/500 error shapes etc.) fill statuses
-  // nothing route-specific documented.
+  // nothing route-specific documented. They live once in
+  // components.responses; operations only carry a $ref.
   if (ctx.defaultResponses) {
-    for (const [status, config] of Object.entries(ctx.defaultResponses)) {
-      if (responses[status]) continue;
-      const entry = { description: config.description || statusDescription(status) };
-      if (config.schema) {
-        const schema = ctx.envelope && envelopeAppliesTo(ctx.envelope, status)
-          ? applyEnvelope(ctx.envelope, config.schema)
-          : config.schema;
-        entry.content = { 'application/json': buildMedia(opts, schema, schema, []) };
-      }
-      responses[status] = entry;
+    for (const status of Object.keys(ctx.defaultResponses)) {
+      if (!responses[status]) responses[status] = { $ref: `#/components/responses/${defaultResponseName(status)}` };
     }
   }
   op.responses = responses;
@@ -617,6 +644,26 @@ function buildOperation({ route, runtime, components, opts, sourceIndex, usedOpe
   return { oaPath, method, op };
 }
 
+function defaultResponseName(status) {
+  return `Default${status}`;
+}
+
+/** components.responses entries for opts.defaultResponses. */
+function buildDefaultResponseComponents(ctx, opts) {
+  const out = {};
+  for (const [status, config] of Object.entries(ctx.defaultResponses || {})) {
+    const entry = { description: config.description || statusDescription(status) };
+    if (config.schema) {
+      const schema = ctx.envelope && envelopeAppliesTo(ctx.envelope, status)
+        ? applyEnvelope(ctx.envelope, config.schema)
+        : config.schema;
+      entry.content = { 'application/json': buildMedia(opts, schema, schema, []) };
+    }
+    out[defaultResponseName(status)] = entry;
+  }
+  return out;
+}
+
 function statusDescription(status) {
   const code = Number(status);
   if (code >= 200 && code < 300) return 'Successful response';
@@ -626,7 +673,12 @@ function statusDescription(status) {
   return 'Response';
 }
 
-function buildSpec({ routes, registry, opts }) {
+/**
+ * Build the OpenAPI document. `cache` (optional, owned by the caller and
+ * reused across builds) holds per-route analysis so rebuilds of large APIs
+ * only redo the cheap, traffic-dependent parts.
+ */
+function buildSpec({ routes, registry, opts, cache }) {
   const projectInfo = defaultProjectInfo();
   const components = { schemas: {} };
   const paths = {};
@@ -642,6 +694,7 @@ function buildSpec({ routes, registry, opts }) {
     envelope: resolveEnvelope(opts.envelope),
     defaultResponses: resolveDefaultResponses(opts.defaultResponses),
     prismaSchema: null,
+    routeCache: cache ? (cache.routes || (cache.routes = new Map())) : null,
   };
   try {
     ctx.prismaSchema = loadPrismaSchema(opts.prisma);
@@ -650,6 +703,7 @@ function buildSpec({ routes, registry, opts }) {
   const driftSummary = [];
   for (const route of routes) {
     if (route.internal) continue;
+    if (opts.isExcluded && opts.isExcluded(route.method, route.path)) continue;
     const runtime = registry.get(route.key);
     const { oaPath, method, op } = buildOperation({
       route, runtime, components, opts, sourceIndex, usedOperationIds, ctx,
@@ -680,7 +734,8 @@ function buildSpec({ routes, registry, opts }) {
   if (ctx.security.defaultRequirement && ctx.security.defaultRequirement.length) {
     spec.security = ctx.security.defaultRequirement;
   }
-  if (Object.keys(components.schemas).length || components.securitySchemes) {
+  if (ctx.defaultResponses) components.responses = buildDefaultResponseComponents(ctx, opts);
+  if (Object.keys(components.schemas).length || components.securitySchemes || components.responses) {
     spec.components = components;
     if (!Object.keys(components.schemas).length) delete components.schemas;
   }
@@ -690,7 +745,16 @@ function buildSpec({ routes, registry, opts }) {
     routes: documented,
   };
   if (driftSummary.length) spec['x-jerant'].drift = driftSummary;
-  return spec;
+
+  let out = opts.openapi === '3.1' ? spec : toOpenApi30(spec);
+  if (typeof opts.transformSpec === 'function') {
+    // The hook gets a private deep copy: it may mutate freely without
+    // corrupting schema objects cached for the next build.
+    const copy = jsonClone(out);
+    const result = opts.transformSpec(copy);
+    out = result && typeof result === 'object' ? result : copy;
+  }
+  return out;
 }
 
 module.exports = { buildSpec, toOpenApiPath, detectValidation };

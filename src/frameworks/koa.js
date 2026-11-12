@@ -18,12 +18,12 @@ const { routeKey } = require('../scanner');
 
 const INSTANCE = Symbol.for('jerant.instance');
 
-function scanKoaRouters(routers, internalPaths) {
+function scanKoaRouters(routers, isInternalPath) {
   const routes = [];
   for (const router of routers) {
     const stack = (router && router.stack) || [];
     for (const layer of stack) {
-      if (typeof layer.path !== 'string' || internalPaths.has(layer.path)) continue;
+      if (typeof layer.path !== 'string' || isInternalPath(layer.path)) continue;
       const methods = (layer.methods || []).filter((m) => m !== 'HEAD');
       const handles = (layer.stack || []).filter((h) => typeof h === 'function');
       for (const method of methods) {
@@ -47,26 +47,32 @@ function jerantKoa(app, options = {}) {
   if (app[INSTANCE]) return app[INSTANCE];
 
   const { routers = [], ...rest } = options;
-  const core = createCore(rest);
+  const routerList = Array.isArray(routers) ? routers : [routers];
+  let isInternalPath = () => false;
+  const scan = () => scanKoaRouters(routerList, isInternalPath);
+  const core = createCore(rest, {
+    scan,
+    routeCount: () => routerList.reduce((n, r) => n + ((r && r.stack && r.stack.length) || 0), 0),
+  });
   if (!core.enabled) {
     const disabled = disabledInstance(core.opts);
     app[INSTANCE] = disabled;
     return disabled;
   }
-  const { opts } = core;
-  const internalPaths = new Set([opts.docsPath, opts.openapiPath]);
-  const routerList = Array.isArray(routers) ? routers : [routers];
-  const scan = () => scanKoaRouters(routerList, internalPaths);
+  const { opts, server } = core;
+  isInternalPath = server.isInternalPath;
 
   app.use(async (ctx, next) => {
-    if (ctx.method === 'GET' && ctx.path === opts.docsPath && core.docsHtml !== null) {
-      ctx.type = 'html';
-      ctx.body = core.docsHtml;
-      return;
-    }
-    if (ctx.method === 'GET' && ctx.path === opts.openapiPath) {
-      ctx.body = core.getSpec(scan());
-      return;
+    if ((ctx.method === 'GET' || ctx.method === 'HEAD') && server.isInternalPath(ctx.path)) {
+      const response = await server.handle({
+        method: ctx.method, path: ctx.path, headers: ctx.headers, query: ctx.query, nativeReq: ctx,
+      });
+      if (response) {
+        ctx.status = response.status;
+        ctx.set(response.headers);
+        ctx.body = response.status === 304 ? null : response.body;
+        return;
+      }
     }
 
     await next();
@@ -74,7 +80,8 @@ function jerantKoa(app, options = {}) {
     if (!opts.runtime.enabled || !core.sampleHit()) return;
     // @koa/router exposes the matched pattern after routing.
     const pattern = ctx._matchedRoute;
-    if (typeof pattern !== 'string' || internalPaths.has(pattern)) return;
+    if (typeof pattern !== 'string' || server.isInternalPath(pattern)) return;
+    if (!core.shouldRecord(routeKey(ctx.method, pattern), ctx.method, pattern)) return;
     const body = ctx.body;
     core.record(routeKey(ctx.method, pattern), {
       body: ctx.request.body, // populated by koa-bodyparser and friends
@@ -87,15 +94,7 @@ function jerantKoa(app, options = {}) {
     });
   });
 
-  const instance = {
-    enabled: true,
-    options: opts,
-    registry: core.registry,
-    getSpec: (force) => core.getSpec(scan(), force),
-    refresh: () => core.getSpec(scan(), true),
-    flush: () => core.storage.flush(() => core.registry.toJSON()),
-    close: () => core.storage.close(),
-  };
+  const instance = core.instance();
   app[INSTANCE] = instance;
   return core.registerInstance(instance);
 }

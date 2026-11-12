@@ -13,7 +13,28 @@ export interface JerantRuntimeOptions {
   maxObservations?: number;
   /** Skip payloads larger than this many bytes. Default: 102400 */
   maxBodyBytes?: number;
+  /** Adaptive sampling: once a route has `warmup` observations, record
+   * further requests with probability warmup / observations. Default: true */
+  adaptive?: boolean;
+  /** Observations per route recorded in full before adaptive sampling
+   * kicks in. Default: 50 (20 in production mode) */
+  warmup?: number;
 }
+
+/** A route as seen by exclude predicates. */
+export interface JerantRouteRef {
+  method: string;
+  path: string;
+}
+
+/** Exclusion rule: '/internal/*', 'GET /health', a RegExp on the path, or a predicate. */
+export type JerantExcludeRule = string | RegExp | ((route: JerantRouteRef) => boolean);
+
+/** Docs/spec protection: HTTP Basic credentials, or a check run against the
+ * framework's native request (Express req, Fastify request, Koa ctx, Hono c). */
+export type JerantAuth =
+  | { username: string; password: string; realm?: string }
+  | ((req: any) => boolean | Promise<boolean>);
 
 /** Contract for user-supplied stores (Redis, S3, a shared DB). load() may
  * return a promise; jerant debounces save() calls itself. */
@@ -121,14 +142,42 @@ export interface JerantOptions {
     | 'scalar'
     | false
     | { html: string }
-    | ((ctx: { openapiPath: string; docsPath: string; title?: string }) => string);
+    | ((ctx: {
+        openapiPath: string;
+        docsPath: string;
+        title?: string;
+        /** jerant's theme stylesheet (dark + light), for reuse in custom pages. */
+        themeCss: string;
+        /** URL the theme stylesheet is served at (`${docsPath}/theme.css`). */
+        themeCssPath: string;
+      }) => string);
   /** Swagger UI asset base URL. Default: unpkg swagger-ui-dist@5 */
   cdn?: string;
   /** 'cdn' (default) or 'local' — serve swagger-ui-dist from node_modules
    * under `${docsPath}/assets` for offline / strict-CSP setups. */
   assets?: 'cdn' | 'local';
-  /** Spec rebuild throttle in ms. Default: 2000 */
+  /** Minimum interval between spec rebuilds in ms. Rebuilds run in the
+   * background and only when routes or learned data changed. Default: 5000 */
   cacheTtlMs?: number;
+  /** OpenAPI version of the served document. '3.0' renders much faster in
+   * Swagger UI. Default: '3.0' */
+  openapi?: '3.0' | '3.1';
+  /** 'production' turns off the learning features (teach mode) and makes
+   * traffic recording cheaper. Default: from NODE_ENV. */
+  mode?: 'development' | 'production';
+  /** Docs theme: dark (black + lavender), light (white + violet), or 'auto'
+   * (OS preference; the header toggle remembers the choice). Default: 'auto' */
+  theme?: 'auto' | 'dark' | 'light';
+  /** Extra Swagger UI options merged over jerant's defaults (JSON-serializable
+   * values only), e.g. { docExpansion: 'none', syntaxHighlight: false }. */
+  swaggerUi?: Record<string, unknown>;
+  /** Routes to leave out of the docs and the runtime analyzer. */
+  exclude?: JerantExcludeRule | JerantExcludeRule[];
+  /** Edit the generated document before it is served or exported. Receives
+   * a private copy; return a replacement or mutate in place. */
+  transformSpec?: (spec: Record<string, any>) => Record<string, any> | void;
+  /** Put the docs page, spec, theme and assets behind authentication. */
+  auth?: JerantAuth;
   /** Instrument the router prototype to capture Express 5 mount paths. Default: true */
   patchRouter?: boolean;
   /** Additional field names to redact from stored payloads. */
@@ -164,7 +213,7 @@ export interface JerantInstance {
   enabled: boolean;
   options: Required<JerantOptions>;
   registry?: unknown;
-  /** Current OpenAPI 3.1 document (cached). */
+  /** Current OpenAPI document (cached). */
   getSpec(force?: boolean): Record<string, unknown> | null;
   /** Force a rebuild of the OpenAPI document. */
   refresh(): Record<string, unknown> | null;
@@ -230,5 +279,11 @@ export const adapters: {
   adapters: Record<string, SchemaAdapter | Record<string, unknown>>;
   expressValidator: Record<string, unknown>;
 };
+
+/** jerant's docs theme stylesheet (dark + light variables, Swagger UI skin). */
+export const themeCss: string;
+
+/** Convert an OpenAPI 3.1 document produced by jerant into OpenAPI 3.0.3. */
+export function toOpenApi30(spec: Record<string, any>): Record<string, any>;
 
 export default jerant;

@@ -1,6 +1,7 @@
 'use strict';
 
-// jerant — zero-config automatic API documentation for Express.
+// jerant — zero-config automatic API documentation for Express (plus
+// Fastify, Koa and Hono adapters).
 //
 //   const express = require('express');
 //   const { jerant } = require('jerant');
@@ -8,22 +9,17 @@
 //   jerant(app);
 //   app.listen(3000);   // docs at /docs, spec at /openapi.json
 
-const { resolveOptions } = require('./options');
-const { Registry } = require('./registry');
+const { createCore, disabledInstance } = require('./frameworks/core');
 const { createAnalyzer } = require('./analyzer');
 const { scanRoutes, getRootStack } = require('./scanner');
-const { buildSpec } = require('./openapi');
-const { renderDocsPage } = require('./docs-ui');
-const { createStorage } = require('./storage');
-const { createAssetsHandler } = require('./assets');
+const { writeNode } = require('./serve');
 const { instrumentMounts, patchRouterPrototype } = require('./mounts');
-const { validate, doc, setValidationErrorDefaults } = require('./validate');
+const { validate, doc } = require('./validate');
+const { themeCss } = require('./docs-ui');
+const { toOpenApi30 } = require('./downgrade');
 const adapters = require('./adapters');
 
 const INSTANCE = Symbol.for('jerant.instance');
-// All live instances in this process; lets `npx jerant export` find the app.
-const INSTANCES = Symbol.for('jerant.instances');
-if (!globalThis[INSTANCES]) globalThis[INSTANCES] = [];
 
 function jerant(app, options = {}) {
   if (!app || typeof app.use !== 'function' || typeof app.get !== 'function') {
@@ -31,91 +27,42 @@ function jerant(app, options = {}) {
   }
   if (app[INSTANCE]) return app[INSTANCE];
 
-  const opts = resolveOptions(options);
-  if (!opts.enabled) {
-    const disabled = { enabled: false, options: opts, getSpec: () => null, refresh: () => null, flush: () => {}, close: () => {} };
+  const core = createCore(options, {
+    scan: () => scanRoutes(app),
+    // Cheap change detector: the root stack grows when routes/routers are added.
+    routeCount: () => getRootStack(app).length,
+  });
+  if (!core.enabled) {
+    const disabled = disabledInstance(core.opts);
     app[INSTANCE] = disabled;
     return disabled;
   }
-
-  if (opts.validationError) setValidationErrorDefaults(opts.validationError);
+  const { opts, server } = core;
 
   // Record router mount paths as they happen (required for Express 5,
   // where mount prefixes cannot be reconstructed from the router stack).
   instrumentMounts(app);
   if (opts.patchRouter) patchRouterPrototype(app);
 
-  const registry = new Registry({
-    maxObservations: opts.runtime.maxObservations,
-    maxExamples: opts.runtime.maxExamples,
-    maxBodyBytes: opts.runtime.maxBodyBytes,
-    redactKeys: opts.redactKeys,
-  });
-  const storage = createStorage(opts.storage);
-  const persisted = storage.load();
-  if (persisted && typeof persisted.then === 'function') {
-    // Async stores (Redis et al) hydrate the registry when they resolve.
-    persisted.then((data) => { if (data) registry.loadJSON(data); }).catch(() => {});
-  } else if (persisted) {
-    registry.loadJSON(persisted);
-  }
-
   if (opts.runtime.enabled) {
-    app.use(createAnalyzer(
-      registry,
-      opts,
-      () => storage.scheduleSave(() => registry.toJSON()),
-      () => scanRoutes(app) // tags route objects with mount prefixes; no spec build
-    ));
+    app.use(createAnalyzer(core, () => scanRoutes(app)));
   }
 
-  // Spec cache: routes rarely change after boot, but runtime analysis keeps
-  // learning, so rebuild at most once per cacheTtlMs (and immediately when
-  // the router stack grows).
-  let cache = null;
-  function getSpec(force = false) {
-    const stackSize = getRootStack(app).length;
-    const now = Date.now();
-    if (!force && cache && cache.stackSize === stackSize && now - cache.builtAt < opts.cacheTtlMs) {
-      return cache.spec;
-    }
-    const routes = scanRoutes(app);
-    const spec = buildSpec({ routes, registry, opts });
-    cache = { spec, builtAt: now, stackSize };
-    return spec;
-  }
-
-  const openapiHandler = (req, res) => {
-    res.json(getSpec());
-  };
-  openapiHandler.__jerantInternal = true;
-  app.get(opts.openapiPath, openapiHandler);
-
-  if (opts.assets === 'local') {
-    app.get(`${opts.docsPath}/assets/:file`, createAssetsHandler());
-  }
-
-  const docsHtml = renderDocsPage(opts); // null with ui: false (spec only)
-  if (docsHtml !== null) {
-    const docsHandler = (req, res) => {
-      res.type('html').send(docsHtml);
+  // jerant's own endpoints: spec, docs page, theme.css, local assets.
+  for (const routePath of server.routes) {
+    const isAssets = routePath.endsWith('/:file');
+    const handler = (req, res, next) => {
+      const path = isAssets ? routePath.slice(0, -':file'.length) + req.params.file : routePath;
+      server.handle({ method: req.method, path, headers: req.headers, query: req.query, nativeReq: req })
+        .then((response) => (response ? writeNode(res, response) : next()), next);
     };
-    docsHandler.__jerantInternal = true;
-    app.get(opts.docsPath, docsHandler);
+    handler.__jerantInternal = true;
+    app.get(routePath, handler);
   }
 
-  const instance = {
-    enabled: true,
-    options: opts,
-    registry,
-    getSpec,
-    refresh: () => getSpec(true),
-    flush: () => storage.flush(() => registry.toJSON()),
-    close: () => storage.close(),
-  };
+  const instance = core.instance();
   app[INSTANCE] = instance;
-  globalThis[INSTANCES].push(instance);
-  return instance;
+  return core.registerInstance(instance);
 }
 
 module.exports = jerant;
@@ -124,6 +71,8 @@ module.exports.default = jerant;
 module.exports.validate = validate;
 module.exports.doc = doc;
 module.exports.adapters = adapters;
+module.exports.themeCss = themeCss;
+module.exports.toOpenApi30 = toOpenApi30;
 module.exports.jerantFastify = require('./frameworks/fastify').jerantFastify;
 module.exports.jerantKoa = require('./frameworks/koa').jerantKoa;
 module.exports.jerantHono = require('./frameworks/hono').jerantHono;

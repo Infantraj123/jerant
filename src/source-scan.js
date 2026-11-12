@@ -174,25 +174,54 @@ function consumedSegments(fullPath, candidate) {
   return full.slice(0, full.length - kept).filter((s) => !s.startsWith(':'));
 }
 
-function findRegistrationArgs(files, method, fullPath) {
-  const m = method.toLowerCase();
-  const methodPattern = m === 'all' ? 'all' : `(?:${m}|all)`;
-  for (const candidate of pathCandidates(fullPath)) {
-    const re = new RegExp(
-      `\\.\\s*${methodPattern}\\s*\\(\\s*(['"\`])${escapeRegExp(candidate)}\\1`,
-      'g'
-    );
-    const found = [];
-    for (const { file, text } of files) {
-      let match;
-      while ((match = re.exec(text))) {
-        const openParen = match.index + match[0].indexOf('(');
-        const args = extractBalanced(text, openParen, '(', ')');
-        if (args) found.push({ args, file, text });
-        if (found.length > 4) break;
-      }
-      re.lastIndex = 0;
+// Every `.get('/path'` / `.post("/path"` ... call in the project, indexed
+// once per source index by "method path". Looking routes up in this map
+// keeps source scanning linear in project size, instead of re-scanning
+// every file for every route (quadratic on large APIs).
+const REGISTRATION_RE = /\.\s*(get|post|put|patch|delete|options|head|all)\s*\(\s*(['"`])([^'"`\n]*)\2/g;
+
+function registrationIndex(files) {
+  const cached = registrationIndexCache.get(files);
+  if (cached) return cached;
+  const index = new Map();
+  for (const entry of files) {
+    const { text } = entry;
+    REGISTRATION_RE.lastIndex = 0;
+    let match;
+    while ((match = REGISTRATION_RE.exec(text))) {
+      const key = `${match[1]} ${match[3]}`;
+      let list = index.get(key);
+      if (!list) index.set(key, (list = []));
+      list.push({ entry, openParen: match.index + match[0].indexOf('(') });
     }
+  }
+  registrationIndexCache.set(files, index);
+  return index;
+}
+const registrationIndexCache = new WeakMap();
+
+function lookupRegistrations(files, method, candidate) {
+  const index = registrationIndex(files);
+  const m = method.toLowerCase();
+  const hits = [...(index.get(`${m} ${candidate}`) || [])];
+  if (m !== 'all') hits.push(...(index.get(`all ${candidate}`) || []));
+  // Keep source order (file order, then position) like a sequential scan.
+  if (m !== 'all' && hits.length > 1) {
+    const order = new Map(files.map((f, i) => [f, i]));
+    hits.sort((a, b) => (order.get(a.entry) - order.get(b.entry)) || (a.openParen - b.openParen));
+  }
+  const found = [];
+  for (const { entry, openParen } of hits) {
+    const args = extractBalanced(entry.text, openParen, '(', ')');
+    if (args) found.push({ args, file: entry.file, text: entry.text });
+    if (found.length > 4) break;
+  }
+  return found;
+}
+
+function findRegistrationArgs(files, method, fullPath) {
+  for (const candidate of pathCandidates(fullPath)) {
+    const found = lookupRegistrations(files, method, candidate);
     if (found.length === 0) continue;
     // Two registrations of the same method+path (separate apps, versioned
     // routers) cannot be told apart at the text level — scan none of them.

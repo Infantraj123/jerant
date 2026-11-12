@@ -50,7 +50,7 @@ test('express 5: routes, nested routers (any mount order), runtime analysis', as
   await new Promise((r) => setTimeout(r, 50));
 
   const spec = await (await fetch(`${base}/openapi.json`)).json();
-  assert.equal(spec.openapi, '3.1.0');
+  assert.equal(spec.openapi, '3.0.3');
   assert.ok(spec.paths['/users'].post);
   assert.equal(spec.paths['/users'].post['x-jerant'].source, 'zod');
 

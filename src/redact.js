@@ -33,11 +33,44 @@ function isSensitiveKey(key, extraKeys) {
   if (SENSITIVE_KEYS.has(normalized)) return true;
   if (SENSITIVE_KEY_PATTERN.test(String(key))) return true;
   if (extraKeys) {
+    if (extraKeys instanceof Set) return extraKeys.has(normalized);
     for (const extra of extraKeys) {
       if (normalizeKey(extra) === normalized) return true;
     }
   }
   return false;
+}
+
+/** Pre-normalized Set form of redactKeys for the hot path. */
+function compileRedactKeys(extraKeys) {
+  return new Set((extraKeys || []).map(normalizeKey));
+}
+
+/**
+ * In-place variant of redact() for data jerant already owns (a fresh
+ * JSON.parse result): no second deep copy on the recording hot path.
+ * Returns the (possibly replaced) value; undefined means "drop it".
+ */
+function redactInPlace(value, extraKeys, depth = 0) {
+  if (value === null || typeof value !== 'object') {
+    return typeof value === 'string' && isSensitiveValue(value) ? REDACTED : value;
+  }
+  if (depth > 10) return undefined;
+  if (Array.isArray(value)) {
+    if (value.length > 100) value.length = 100;
+    for (let i = 0; i < value.length; i++) value[i] = redactInPlace(value[i], extraKeys, depth + 1);
+    return value;
+  }
+  for (const key of Object.keys(value)) {
+    if (isSensitiveKey(key, extraKeys)) {
+      value[key] = REDACTED;
+    } else {
+      const next = redactInPlace(value[key], extraKeys, depth + 1);
+      if (next === undefined) delete value[key];
+      else value[key] = next;
+    }
+  }
+  return value;
 }
 
 function isSensitiveValue(value) {
@@ -73,4 +106,4 @@ function redact(value, extraKeys, depth = 0) {
   return out;
 }
 
-module.exports = { redact, isSensitiveKey, isSensitiveValue, REDACTED };
+module.exports = { redact, redactInPlace, compileRedactKeys, isSensitiveKey, isSensitiveValue, REDACTED };

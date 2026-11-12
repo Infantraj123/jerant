@@ -20,20 +20,19 @@ function jerantFastify(fastify, options = {}) {
   }
   if (fastify[INSTANCE]) return fastify[INSTANCE];
 
-  const core = createCore(options);
+  const routes = [];
+  const core = createCore(options, { scan: () => routes, routeCount: () => routes.length });
   if (!core.enabled) {
     const disabled = disabledInstance(core.opts);
     fastify[INSTANCE] = disabled;
     return disabled;
   }
-  const { opts } = core;
-  const internalPaths = new Set([opts.docsPath, opts.openapiPath]);
+  const { opts, server } = core;
 
-  const routes = [];
   fastify.addHook('onRoute', (routeOptions) => {
     const methods = Array.isArray(routeOptions.method) ? routeOptions.method : [routeOptions.method];
     const path = routeOptions.url;
-    if (typeof path !== 'string' || internalPaths.has(path)) return;
+    if (typeof path !== 'string' || server.isInternalPath(path)) return;
     const handles = [];
     if (routeOptions.schema) {
       handles.push(markerFromJsonSchemas({
@@ -63,7 +62,8 @@ function jerantFastify(fastify, options = {}) {
       try {
         if (core.sampleHit()) {
           const pattern = (request.routeOptions && request.routeOptions.url) || request.routerPath;
-          if (typeof pattern === 'string' && !internalPaths.has(pattern)) {
+          if (typeof pattern === 'string' && !server.isInternalPath(pattern) &&
+              core.shouldRecord(routeKey(request.method, pattern), request.method, pattern)) {
             let responseBody;
             const type = String(reply.getHeader('content-type') || '');
             if (typeof payload === 'string' && type.includes('json')) {
@@ -85,24 +85,20 @@ function jerantFastify(fastify, options = {}) {
     });
   }
 
-  fastify.get(opts.openapiPath, (request, reply) => {
-    reply.send(core.getSpec(routes));
-  });
-  if (core.docsHtml !== null) {
-    fastify.get(opts.docsPath, (request, reply) => {
-      reply.type('text/html').send(core.docsHtml);
+  for (const routePath of server.routes) {
+    const isAssets = routePath.endsWith('/:file');
+    fastify.get(routePath, async (request, reply) => {
+      const path = isAssets ? routePath.slice(0, -':file'.length) + request.params.file : routePath;
+      const response = await server.handle({
+        method: request.method, path, headers: request.headers, query: request.query, nativeReq: request,
+      });
+      if (!response) return reply.callNotFound();
+      reply.code(response.status).headers(response.headers);
+      return reply.send(response.body);
     });
   }
 
-  const instance = {
-    enabled: true,
-    options: opts,
-    registry: core.registry,
-    getSpec: (force) => core.getSpec(routes, force),
-    refresh: () => core.getSpec(routes, true),
-    flush: () => core.storage.flush(() => core.registry.toJSON()),
-    close: () => core.storage.close(),
-  };
+  const instance = core.instance();
   fastify[INSTANCE] = instance;
   return core.registerInstance(instance);
 }

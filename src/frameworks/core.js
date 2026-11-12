@@ -7,14 +7,18 @@
 const { resolveOptions } = require('../options');
 const { Registry } = require('../registry');
 const { buildSpec } = require('../openapi');
-const { renderDocsPage } = require('../docs-ui');
 const { createStorage } = require('../storage');
 const { setValidationErrorDefaults } = require('../validate');
+const { createServer, createSpecService } = require('../serve');
 
 const INSTANCES = Symbol.for('jerant.instances');
 if (!globalThis[INSTANCES]) globalThis[INSTANCES] = [];
 
-function createCore(options = {}) {
+/**
+ * `scan()` returns the framework's current route list; `routeCount()` is a
+ * cheap fingerprint of it (defaults to scan().length).
+ */
+function createCore(options = {}, { scan, routeCount } = {}) {
   const opts = resolveOptions(options);
   if (!opts.enabled) return { opts, enabled: false };
 
@@ -25,6 +29,9 @@ function createCore(options = {}) {
     maxExamples: opts.runtime.maxExamples,
     maxBodyBytes: opts.runtime.maxBodyBytes,
     redactKeys: opts.redactKeys,
+    keepExamples: opts.examples === 'captured',
+    adaptive: opts.runtime.adaptive !== false,
+    warmup: opts.runtime.warmup,
   });
   const storage = createStorage(opts.storage);
   const persisted = storage.load();
@@ -34,22 +41,29 @@ function createCore(options = {}) {
     registry.loadJSON(persisted);
   }
 
-  let cache = null;
-  function getSpec(routes, force = false) {
-    const now = Date.now();
-    if (!force && cache && cache.routeCount === routes.length && now - cache.builtAt < opts.cacheTtlMs) {
-      return cache.spec;
-    }
-    const spec = buildSpec({ routes, registry, opts });
-    cache = { spec, builtAt: now, routeCount: routes.length };
-    return spec;
+  const buildCache = {}; // per-route analysis, reused across rebuilds
+  const countRoutes = routeCount || (() => scan().length);
+  const specService = createSpecService({
+    opts,
+    build: () => buildSpec({ routes: scan(), registry, opts, cache: buildCache }),
+    inputsKey: () => `${countRoutes()}:${registry.version}`,
+  });
+  const server = createServer({ opts, specService });
+
+  /** Request-path gate: sampling, exclusions and per-route saturation. */
+  function shouldRecord(key, method, path) {
+    if (!opts.runtime.enabled) return false;
+    if (opts.isExcluded && opts.isExcluded(method, path)) return false;
+    return registry.wants(key);
   }
+
+  const save = () => storage.scheduleSave(() => registry.toJSON());
 
   function record(key, sample) {
     setImmediate(() => {
       try {
         registry.record(key, sample);
-        storage.scheduleSave(() => registry.toJSON());
+        save();
       } catch { /* analysis must never break the app */ }
     });
   }
@@ -59,10 +73,25 @@ function createCore(options = {}) {
     opts,
     registry,
     storage,
-    getSpec,
+    specService,
+    server,
+    getSpec: (force) => specService.getSpec(force),
     record,
-    docsHtml: renderDocsPage(opts),
-    sampleHit: () => opts.runtime.sampleRate >= 1 || Math.random() <= opts.runtime.sampleRate,
+    save,
+    shouldRecord,
+    sampleHit: () => opts.runtime.sampleRate >= 1 || Math.random() < opts.runtime.sampleRate,
+    /** The public instance object every adapter returns. */
+    instance() {
+      return {
+        enabled: true,
+        options: opts,
+        registry,
+        getSpec: (force) => specService.getSpec(force),
+        refresh: () => specService.getSpec(true),
+        flush: () => storage.flush(() => registry.toJSON()),
+        close: () => storage.close(),
+      };
+    },
     registerInstance(instance) {
       globalThis[INSTANCES].push(instance);
       return instance;

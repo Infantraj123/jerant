@@ -80,10 +80,11 @@ test('res.json/res.send wrappers are restored after the response', async (t) => 
 test('double-installed analyzer never double-wraps a response', async (t) => {
   const app = express();
   const instance = jerant(app);
-  // Simulate a second analyzer in the chain (e.g. jerant on app AND a router).
-  const { createAnalyzer } = require('../src/analyzer');
-  app.use(createAnalyzer(instance.registry, instance.options, null, null));
-  app.get('/once', (req, res) => res.json({ n: 1 }));
+  // A second analyzer in the chain: jerant on the app AND on a router.
+  const router = express.Router();
+  jerant(router, { docsPath: '/router-docs', openapiPath: '/router-openapi.json' });
+  router.get('/once', (req, res) => res.json({ n: 1 }));
+  app.use(router);
 
   const server = await listen(app);
   t.after(() => server.close());

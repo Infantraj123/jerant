@@ -12,9 +12,9 @@ const { joinPaths } = require('./util');
 // both an app and a mounted router, re-entry via next('route'), ...).
 const INSTRUMENTED = Symbol.for('jerant.resInstrumented');
 
-function createAnalyzer(registry, opts, onRecord, onFirstRequest) {
+function createAnalyzer(core, onFirstRequest) {
+  const { opts, server } = core;
   const sampleRate = opts.runtime.sampleRate;
-  const internalPaths = new Set([opts.docsPath, opts.openapiPath]);
   let firstRequestSeen = false;
 
   const analyzer = function jerantAnalyzer(req, res, next) {
@@ -25,7 +25,7 @@ function createAnalyzer(registry, opts, onRecord, onFirstRequest) {
       if (onFirstRequest) setImmediate(() => { try { onFirstRequest(); } catch { /* best-effort */ } });
     }
     if (res[INSTRUMENTED]) return next();
-    if (sampleRate < 1 && Math.random() > sampleRate) return next();
+    if (sampleRate < 1 && !(Math.random() < sampleRate)) return next();
     res[INSTRUMENTED] = true;
 
     let responseBody;
@@ -87,7 +87,10 @@ function createAnalyzer(registry, opts, onRecord, onFirstRequest) {
       const fullPath = prefix !== undefined
         ? joinPaths(prefix, routePath)
         : (req.baseUrl || '') + routePath;
-      if (internalPaths.has(fullPath)) return;
+      if (server.isInternalPath(fullPath)) return;
+      const key = routeKey(req.method, fullPath);
+      // Excluded, saturated or adaptively-skipped routes cost nothing more.
+      if (!core.shouldRecord(key, req.method, fullPath)) return;
 
       // Media type only (no header values are ever stored) plus multipart
       // file field names populated by upload middleware (multer et al).
@@ -112,14 +115,7 @@ function createAnalyzer(registry, opts, onRecord, onFirstRequest) {
         contentType,
         fileFields,
       };
-      const key = routeKey(req.method, fullPath);
-
-      setImmediate(() => {
-        try {
-          registry.record(key, sample);
-          if (onRecord) onRecord();
-        } catch { /* analysis must never break the app */ }
-      });
+      core.record(key, sample);
     });
 
     next();

@@ -15,11 +15,11 @@ const { routeKey } = require('../scanner');
 
 const INSTANCE = Symbol.for('jerant.instance');
 
-function scanHonoRoutes(app, internalPaths) {
+function scanHonoRoutes(app, isInternalPath) {
   const routes = [];
   const seen = new Set();
   for (const r of app.routes || []) {
-    if (!r || typeof r.path !== 'string' || internalPaths.has(r.path)) continue;
+    if (!r || typeof r.path !== 'string' || isInternalPath(r.path)) continue;
     if (r.method === 'ALL' || typeof r.handler !== 'function') continue;
     // Middleware registered via app.use shows up with path '/*'.
     if (r.path.endsWith('*')) continue;
@@ -43,15 +43,16 @@ function jerantHono(app, options = {}) {
   }
   if (app[INSTANCE]) return app[INSTANCE];
 
-  const core = createCore(options);
+  let isInternalPath = () => false;
+  const scan = () => scanHonoRoutes(app, isInternalPath);
+  const core = createCore(options, { scan, routeCount: () => (app.routes || []).length });
   if (!core.enabled) {
     const disabled = disabledInstance(core.opts);
     app[INSTANCE] = disabled;
     return disabled;
   }
-  const { opts } = core;
-  const internalPaths = new Set([opts.docsPath, opts.openapiPath]);
-  const scan = () => scanHonoRoutes(app, internalPaths);
+  const { opts, server } = core;
+  isInternalPath = server.isInternalPath;
 
   if (opts.runtime.enabled) {
     app.use(async (c, next) => {
@@ -59,7 +60,8 @@ function jerantHono(app, options = {}) {
       try {
         if (!core.sampleHit()) return;
         const pattern = c.req.routePath;
-        if (typeof pattern !== 'string' || pattern.endsWith('*') || internalPaths.has(pattern)) return;
+        if (typeof pattern !== 'string' || pattern.endsWith('*') || server.isInternalPath(pattern)) return;
+        if (!core.shouldRecord(routeKey(c.req.method, pattern), c.req.method, pattern)) return;
 
         const contentType = String(c.req.header('content-type') || '').split(';')[0].trim().toLowerCase();
         let body;
@@ -84,20 +86,22 @@ function jerantHono(app, options = {}) {
     });
   }
 
-  app.get(opts.openapiPath, (c) => c.json(core.getSpec(scan())));
-  if (core.docsHtml !== null) {
-    app.get(opts.docsPath, (c) => c.html(core.docsHtml));
+  for (const routePath of server.routes) {
+    const isAssets = routePath.endsWith('/:file');
+    app.get(routePath, async (c) => {
+      const path = isAssets ? routePath.slice(0, -':file'.length) + c.req.param('file') : routePath;
+      const response = await server.handle({
+        method: c.req.method, path, headers: c.req.raw.headers, query: c.req.query(), nativeReq: c,
+      });
+      if (!response) return c.notFound();
+      return new Response(response.status === 304 ? null : response.body, {
+        status: response.status,
+        headers: response.headers,
+      });
+    });
   }
 
-  const instance = {
-    enabled: true,
-    options: opts,
-    registry: core.registry,
-    getSpec: (force) => core.getSpec(scan(), force),
-    refresh: () => core.getSpec(scan(), true),
-    flush: () => core.storage.flush(() => core.registry.toJSON()),
-    close: () => core.storage.close(),
-  };
+  const instance = core.instance();
   app[INSTANCE] = instance;
   return core.registerInstance(instance);
 }

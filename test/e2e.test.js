@@ -93,7 +93,7 @@ test('e2e: docs and OpenAPI served from the same app and port', async (t) => {
   assert.equal(specRes.status, 200);
   const spec = await specRes.json();
 
-  assert.equal(spec.openapi, '3.1.0');
+  assert.equal(spec.openapi, '3.0.3');
   assert.equal(spec.info.title, 'Test API');
   assert.equal(spec.info.version, '9.9.9');
 
@@ -203,7 +203,7 @@ test('e2e: validate() enforces schemas with 400 responses', async (t) => {
 
 test('e2e: runtime schema improves as more traffic is observed', async (t) => {
   const app = express();
-  jerant(app);
+  jerant(app, { cacheTtlMs: 0 });
   app.use(express.json());
   app.post('/echo', (req, res) => res.json({ seen: true }));
   const server = await listen(app);
@@ -224,7 +224,10 @@ test('e2e: runtime schema improves as more traffic is observed', async (t) => {
 
   for (let i = 0; i < 10; i++) await post({ name: `user${i}`, age: 20 + i });
   await settle();
-  await new Promise((r) => setTimeout(r, 2100)); // let the spec cache expire
+  // Stale-while-revalidate: this request triggers a background rebuild...
+  await getSpec();
+  await settle();
+  // ...and the next one gets the rebuilt document.
   spec = await getSpec();
   const op = spec.paths['/echo'].post;
   assert.ok(op['x-jerant'].confidence > firstConfidence, 'confidence grows with observations');

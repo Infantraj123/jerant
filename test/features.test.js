@@ -128,8 +128,11 @@ test('envelope: declared response schemas are wrapped once, documented everywher
   assert.equal(wrapped.properties.message.type, 'string');
   assert.equal(wrapped.properties.data.properties.name.type, 'string', 'the $data slot holds the declared schema');
 
-  assert.equal(op.responses['401'].description, 'Not signed in');
-  const errSchema = op.responses['401'].content['application/json'].schema;
+  // Default responses are defined once and referenced, not copied.
+  assert.equal(op.responses['401'].$ref, '#/components/responses/Default401');
+  const shared = spec.components.responses.Default401;
+  assert.equal(shared.description, 'Not signed in');
+  const errSchema = shared.content['application/json'].schema;
   assert.equal(errSchema.properties.error.type, 'string');
 });
 

@@ -2,7 +2,7 @@
 
 **Zero-config automatic API documentation for Express, Fastify, Koa and Hono.**
 
-FastAPI-style docs — OpenAPI 3.1 + a modern dark UI — served from **your own app, on the same port**, with no annotations required. Routes are discovered automatically, schemas are learned from your validation libraries, your Prisma schema, your source code, and real traffic.
+FastAPI-style docs — OpenAPI 3.0/3.1 + a modern dark/light UI — served from **your own app, on the same port**, with no annotations required. Routes are discovered automatically, schemas are learned from your validation libraries, your Prisma schema, your source code, and real traffic.
 
 ```bash
 npm install jerant
@@ -23,8 +23,8 @@ That's it:
 | URL | What |
 | --- | --- |
 | `http://localhost:3000` | Your application, unchanged |
-| `http://localhost:3000/docs` | Interactive docs (dark purple UI, search, try-it-out, teach mode) |
-| `http://localhost:3000/openapi.json` | OpenAPI 3.1 document |
+| `http://localhost:3000/docs` | Interactive docs (dark & light themes, search, try-it-out, teach mode) |
+| `http://localhost:3000/openapi.json` | OpenAPI document (3.0 by default, 3.1 on request) |
 
 No separate documentation server, no code generation step, no YAML.
 
@@ -51,7 +51,8 @@ No separate documentation server, no code generation step, no YAML.
 17. [Full configuration reference](#17-full-configuration-reference)
 18. [Programmatic API](#18-programmatic-api)
 19. [Production notes](#19-production-notes)
-20. [Architecture](#20-architecture)
+20. [Large APIs](#20-large-apis)
+21. [Architecture](#21-architecture)
 
 ---
 
@@ -78,14 +79,14 @@ Every operation shows its source and confidence in the UI and carries machine-re
 - Handler writes into a Prisma model → **75%** automatically
 - Send real requests → climbs to **~90%** (saturates around 30 observations)
 
-**Teach mode** closes the loop from inside the docs. Any operation below 50% confidence opens automatically with a **"◌ Teach this endpoint"** panel where anyone can freely enter:
+**Teach mode** closes the loop from inside the docs. Any operation below 50% confidence is marked **◌ learning**; open it and a **"◌ Teach this endpoint"** panel appears where anyone can freely enter:
 
 - **path params** — one input per `{param}`
 - **query params** — unlimited key/value rows (no declaration needed)
 - **headers** — e.g. an `Authorization` token
 - **body** — raw JSON, form-data (with real file uploads), or url-encoded
 
-Hitting **Send request** exercises your real app; the analyzer observes the request and response, the confidence chip updates live, and a reload shows the learned schema and parameters. Once an operation crosses 50% it graduates to a normal documented endpoint. Disable with `teachMode: false`.
+Hitting **Send request** exercises your real app; the analyzer observes the request and response, the confidence chip updates live, and a reload shows the learned schema and parameters. Once an operation crosses 50% it graduates to a normal documented endpoint. Learning operations are never opened automatically, and the panel is only built when you open one, so large APIs stay fast. Disable with `teachMode: false`. [Production mode](#19-production-notes) turns it off for you.
 
 ## 3. Validation libraries
 
@@ -218,7 +219,7 @@ jerant(app, {
 });
 ```
 
-`defaultResponses` are added to every operation that doesn't already document that status. The envelope also accepts a full JSON Schema containing a `"$data"` slot, plus `{ schema, statuses: [200, 201] }` to control which statuses get wrapped (default: all 2xx).
+`defaultResponses` are defined **once** under `components.responses` (`Default401`, `Default500`, …), and every operation that doesn't already document that status gets a `$ref` to it. They are not copied into each operation. The envelope also accepts a full JSON Schema containing a `"$data"` slot, plus `{ schema, statuses: [200, 201] }` to control which statuses get wrapped (default: all 2xx).
 
 ## 8. Example values
 
@@ -252,22 +253,48 @@ Routes without explicit tags are grouped by their first meaningful path segment 
 
 ## 10. The docs UI
 
-The default UI is a **modern dark theme** (deep purple surfaces, lavender accents) with:
+The default UI comes in two themes:
+
+| Theme | Surfaces | Text & accents |
+|---|---|---|
+| **dark** | black | lavender text, violet accents |
+| **light** | white | deep-violet and lavender text, violet accents |
+
+`theme: "auto"` (the default) follows the OS setting. The ☾/☀ button in the header switches themes and remembers the choice. Force one with `theme: "dark"` or `theme: "light"`.
+
+Features:
 
 - a **stats header**: endpoints, tag groups, schemas, average confidence, drift issues, and endpoints still in learning mode
 - **per-operation confidence chips** — color-graded score with source, observation count and drift warnings on hover
 - **Expand all / Collapse all**, **Copy spec URL**, **Download JSON** buttons
 - **`/`** keyboard shortcut to jump to the endpoint search
 - **teach panels** on low-confidence operations (see [§2](#2-confidence-scores--teach-mode))
-- validated color palette (contrast + colorblind-safe method badges on the dark surface)
+- color palette checked for contrast, with colorblind-safe method badges in both themes
 
 ### Choosing a UI
 
 ```js
 jerant(app, { ui: "swagger" });   // default
-jerant(app, { ui: "redoc" });     // Redoc, same dark purple theme
-jerant(app, { ui: "scalar" });    // Scalar, purple dark mode
+jerant(app, { ui: "redoc" });     // Redoc, same dark/light theme
+jerant(app, { ui: "scalar" });    // Scalar, purple theme (dark or light)
 ```
+
+### Swagger UI settings
+
+Any JSON-serializable [Swagger UI option](https://swagger.io/docs/open-source-tools/swagger-ui/usage/configuration/) is passed through and overrides jerant's defaults:
+
+```js
+jerant(app, {
+  swaggerUi: {
+    docExpansion: "none",        // start collapsed
+    defaultModelsExpandDepth: -1, // hide the Schemas section
+    syntaxHighlight: false,      // faster rendering of big payloads
+    maxDisplayedTags: 50,
+  },
+});
+```
+
+Function-valued options (plugins, `onComplete`, …) are dropped because they can't be embedded in the page. Use `ui: (ctx) => html` if you need them.
 
 ### Self-hosting the assets (offline / strict CSP)
 
@@ -290,6 +317,14 @@ jerant(app, { ui: { html: myHtmlString } });   // your page at docsPath
 jerant(app, {                                  // or a render function
   ui: ({ openapiPath, title }) => `<html>… fetch("${openapiPath}") …</html>`,
 });
+```
+
+Custom pages can reuse jerant's theme. The render function receives `themeCss` (the stylesheet) and `themeCssPath`, and the stylesheet is also served at `/docs/theme.css` and exported from the package:
+
+```js
+const { themeCss } = require("jerant");
+// <html data-theme="dark|light">…<style>${themeCss}</style>…
+// Without a data-theme attribute the CSS follows prefers-color-scheme.
 ```
 
 Any custom UI gets the full spec including the `x-jerant` metadata (source, confidence, drift), so you can render your own badges.
@@ -363,7 +398,7 @@ jerant(app, {
 });
 ```
 
-Writes are debounced and atomic (file mode), with a flush on process exit.
+Writes are debounced and atomic (file mode): a temporary file is written and then renamed over the real one. Scheduled saves are written **asynchronously**, so disk I/O never blocks the event loop. At most one write runs at a time, and saves requested during a write are merged into a single follow-up write. `docs.flush()` and the flush on process exit stay synchronous so the data is on disk before they return.
 
 ## 16. Fastify, Koa and Hono
 
@@ -398,11 +433,23 @@ jerant(app, {
   // Paths
   docsPath: "/docs",
   openapiPath: "/openapi.json",
+  openapi: "3.0",                  // "3.1" for an OpenAPI 3.1 document
+
+  // Environment
+  mode: "development",             // "production" (default when NODE_ENV=production)
 
   // UI
   ui: "swagger",                   // "redoc" | "scalar" | false | {html} | (ctx) => html
+  theme: "auto",                   // "dark" | "light"
+  swaggerUi: { docExpansion: "list" }, // passed through to Swagger UI
   assets: "cdn",                   // "local" = self-hosted swagger-ui-dist
   cdn: "https://unpkg.com/swagger-ui-dist@5",
+
+  // Access & shaping
+  auth: { username: "docs", password: process.env.DOCS_PASSWORD }, // or (req) => boolean
+  exclude: ["/internal/*", "GET /health", /^\/admin/],
+  transformSpec: (spec) => { spec.info["x-logo"] = { url: "/logo.png" }; },
+  cacheTtlMs: 5000,                // min interval between background rebuilds
 
   // Documentation behavior
   security: "bearer",              // auth modeling + Authorize button (§5)
@@ -421,6 +468,8 @@ jerant(app, {
     maxExamples: 3,                // stored examples per route/status
     maxObservations: 1000,         // merge cap per route
     maxBodyBytes: 102400,          // skip larger payloads
+    adaptive: true,                // sample well-known routes less and less
+    warmup: 50,                    // full-rate observations per route first
   },
   sourceScan: { enabled: true },   // project source analysis
   prisma: { enabled: true },       // schema.prisma tracing (§4)
@@ -439,7 +488,7 @@ Disable entirely with `enabled: false` or the `JERANT_DISABLED=1` environment va
 
 ```js
 const docs = jerant(app);
-docs.getSpec();   // current OpenAPI document (cached)
+docs.getSpec();   // current OpenAPI document (cached; rebuilt if stale)
 docs.refresh();   // force a rebuild
 docs.flush();     // persist learned schemas now
 docs.close();     // stop persistence timers
@@ -447,12 +496,82 @@ docs.close();     // stop persistence timers
 
 ## 19. Production notes
 
-- **Overhead**: the middleware only wraps `res.json`/`res.send` (restored after each response) and defers all analysis to `setImmediate` after the response is sent — nothing blocks the request path. Use `runtime.sampleRate` to sample under heavy load.
+### Production mode
+
+```js
+jerant(app, { mode: "production" }); // the default when NODE_ENV=production
+```
+
+Production mode turns off the learning features and makes traffic recording cheaper. Every value below is only a default, so any option you set yourself still wins:
+
+| | development | production |
+|---|---|---|
+| `teachMode` (learning chips + teach panels) | on | **off** |
+| `runtime.sampleRate` | 1 | **0.1** |
+| `runtime.maxObservations` per route | 1000 | **200** |
+| `runtime.warmup` (full-rate observations) | 50 | **20** |
+
+### Protecting the docs
+
+```js
+// HTTP Basic auth (compared in constant time)
+jerant(app, { auth: { username: "docs", password: process.env.DOCS_PASSWORD } });
+
+// Or any check against the framework's request object
+// (Express req, Fastify request, Koa ctx, Hono c); may be async.
+jerant(app, { auth: (req) => req.user?.role === "admin" });
+```
+
+`auth` covers the docs page, the spec, `theme.css` and self-hosted assets. Your own routes are not affected. With the function form, any session or auth middleware that sets `req.user` must run before jerant's routes.
+
+### Request recording cost
+
+- **Overhead**: the middleware only wraps `res.json`/`res.send` (restored after each response) and defers all analysis to `setImmediate` after the response is sent — nothing blocks the request path. Each recorded payload is serialized once; that single pass measures its size, copies it, and is then redacted in place. Use `runtime.sampleRate` to sample under heavy load.
+- **Adaptive sampling** (on by default): a route is recorded at full rate for its first `runtime.warmup` requests. After that it is recorded with probability `warmup / observations`, so a route's recording cost falls toward zero as it becomes well known (about 4.5k of 1M requests get recorded). Routes that reach `maxObservations`, or that are `exclude`d, are skipped before any work is done.
+- **Examples** are only stored when `examples: "captured"` is set, because no other mode displays them.
 - **Call order**: call `jerant(app)` right after `express()` (before your body parser and routes) so the analyzer sees every response. Route *registration* order doesn't matter — discovery is lazy.
 - **CSP**: the `/docs` page loads UI assets from a CDN by default and uses an inline script. Under a strict Content-Security-Policy use `assets: "local"` or allow the `cdn` origin.
 - **CI**: `npx jerant export` + `npx jerant diff` give you spec artifacts and a breaking-change gate without booting a server in tests.
 
-## 20. Architecture
+## 20. Large APIs
+
+jerant is built to keep docs for thousands of operations fast, both in the browser and on the server.
+
+**What happens on the server**
+
+- **The spec is built once and served from cache.** Each document is serialized a single time and given a strong `ETag` (unchanged → `304 Not Modified`). It is compressed with gzip or brotli on Node's thread pool, not the event loop.
+- **Requests never wait for a rebuild.** When routes or learned data change, the next request still gets the cached document while the new one is built in the background. Rebuilds run at most once per `cacheTtlMs` (5 s), and never when nothing changed. A rebuild that produces identical content keeps the old `ETag`.
+- **Per-route analysis is cached.** Schema detection and handler-source analysis are redone only for routes whose handlers changed. Project source files are indexed once instead of being scanned again for every route. On a 3,000-operation project the first build dropped from ~3.3 s to ~0.3 s, and rebuilds take ~70 ms.
+- **Default responses are shared.** `defaultResponses` live once in `components.responses`, not inside every operation.
+- **Self-hosted assets** are read from disk once and kept in memory. Their URLs carry the `swagger-ui-dist` version (`?v=5.x.y`), so they can be cached as `immutable`; unversioned URLs must revalidate.
+
+**What happens in the browser**
+
+- **OpenAPI 3.0 by default.** Swagger UI renders 3.0 documents much faster than 3.1. jerant converts its internal 3.1 schemas to 3.0 (`nullable`, `enum` for `const`, boolean `exclusiveMinimum`, …). Use `openapi: "3.1"` if your tooling needs 3.1.
+- **The spec is downloaded once.** The page starts fetching it in `<head>`, in parallel with the UI bundle, and hands the parsed object straight to Swagger UI.
+- **Decoration is incremental.** Confidence chips and teach panels are added only to the operation blocks that just changed, batched once per animation frame. The page never re-sweeps the whole document.
+- **Nothing opens by itself.** Above 150 operations the page starts with every tag collapsed and the models section hidden (unless you set `swaggerUi.docExpansion` or `defaultModelsExpandDepth` yourself). Learning operations are never auto-opened.
+
+**Recommended settings for very large APIs**
+
+```js
+jerant(app, {
+  mode: "production",                       // or NODE_ENV=production
+  exclude: ["/internal/*", "/health", "/metrics"],
+  swaggerUi: {
+    docExpansion: "none",
+    defaultModelsExpandDepth: -1,
+    syntaxHighlight: false,                 // big example payloads render faster
+    maxDisplayedTags: 30,                   // with filter: true (default) to search the rest
+  },
+  sourceScan: { maxFiles: 2000 },           // raise if your routes span more files
+  storage: { mode: "file" },                // writes are async and coalesced
+});
+```
+
+If you put a CDN or reverse proxy in front of `/openapi.json`, keep its `Cache-Control: no-cache`. That header lets clients store the document but makes them revalidate it with the `ETag`, which costs a 304 when nothing changed.
+
+## 21. Architecture
 
 ```
 Express / Fastify / Koa / Hono App
@@ -463,7 +582,7 @@ Route Scanner ──► discovers every route & nested router
     ├── Prisma Schema Tracing (schema.prisma → typed body fields)
     └── Runtime Analyzer ──► Schema Inference Engine (+ redaction, confidence, drift)
     │
-OpenAPI 3.1 Generator (security, envelopes, tags, default responses, teach mode)
+OpenAPI Generator (security, envelopes, tags, shared default responses, teach mode; 3.1 → 3.0 by default)
     │
     ├── /openapi.json          (also: npx jerant export / diff)
     └── /docs (dark UI: Swagger / Redoc / Scalar / your own)
